@@ -52,25 +52,19 @@ static void runtime_log_init(const kernel_mod_handle_t *handle) {
 
 typedef struct { float x, y; } v2_t;
 typedef struct { int x, y, w, h; } rect_t;
-typedef struct { unsigned char has, pad0, pad1, pad2; float m[16]; } nullable_mat_t;
 
-static void *make_texture(int size, float (*alpha_at)(float));
 
 
 static int g_frames;
 
 static patch_handle_t g_main_type;
 
-#define LIGHTS_TEX 256   /* 借游戏批次绘制时采样是 PointClamp，贴图必须够大才不成方块 */
-static float alpha_soft(float r);
 
 
 static patch_handle_t g_sb_field;        /* Main.spriteBatch */
-static patch_handle_t g_begin9, g_end0, g_draw9;
-static void *g_blend_additive;          /* BlendState.Additive：光要"加"上去，不能盖住背景 */
-static void *nat_begin, *nat_draw;
+static patch_handle_t g_end0, g_draw9;
+static void *nat_draw;
 static void *g_white;                    /* 1x1 白，画实心矩形用 */
-static void *g_soft;            /* 光晕 / 压暗环贴图 */
 
 /* ============================ GC 根 ============================ */
 /* terraria_texture2d_create 返回纹理对象**不带 GC 根**，Unity 的 GC 可以把
@@ -79,7 +73,7 @@ static void *g_soft;            /* 光晕 / 压暗环贴图 */
  * 符号从 libil2cpp.so 里 dlsym（和 LuaLoader 一样）。 */
 static uint32_t (*g_gchandle_new)(void *obj, bool pinned) = NULL;
 static void (*g_gchandle_free)(uint32_t) = NULL;
-static uint32_t texture_roots[2];
+static uint32_t texture_roots[1];
 static int root_count;
 
 /* 从 /proc/self/maps 里扒出真实路径（库常是按全路径映射的 soname 查不到；
@@ -131,7 +125,7 @@ static bool pin_object(void *obj) {
     if (!g_gchandle_new) return false;
     uint32_t root=g_gchandle_new(obj, false);
     if(!root) return false;
-    if(root_count<2) texture_roots[root_count++]=root;
+    if(root_count<1) texture_roots[root_count++]=root;
     if(!g_gchandle_free) {
         void *ext=xdl_open("libil2cpp.so",XDL_DEFAULT);
         if(ext) g_gchandle_free=(void(*)(uint32_t))xdl_sym(ext,"il2cpp_gchandle_free",NULL);
@@ -158,30 +152,22 @@ static bool draw_init(void) {
     if (!sb_type || !main_type) return false;
 
     g_sb_field = patchlib_type_get_field(main_type, "spriteBatch");
-    g_begin9 = patchlib_type_get_method_by_param_count(sb_type, "Begin", 8);
     g_end0   = patchlib_type_get_method_by_param_count(sb_type, "End", 0);
-    g_draw9  = patchlib_type_get_method_by_param_count(sb_type, "Draw", 9);
-    if (!g_begin9 || !g_end0 || !g_draw9) return false;
-    /* BlendState.Additive（静态字段）——光加色叠加才是提亮而不是盖住背景 */
-    {
-        patch_handle_t bs_type = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics", "BlendState");
-        /* 字段优先，取不到再试属性 get_Additive（PE 上很多静态量是属性） */
-        patch_handle_t f_add = bs_type ? patchlib_type_get_field(bs_type, "Additive") : NULL;
-        void *slot = f_add ? patchlib_field_get_pointer(f_add, NULL) : NULL;
-        if (slot) g_blend_additive = *(void **)slot;
-        if (!g_blend_additive && bs_type) {
-            patch_handle_t getter = patchlib_type_get_method_by_param_count(bs_type, "get_Additive", 0);
-            if (getter && patchlib_is_valid(getter)) {
-                void *obj = NULL;
-                if (patchlib_method_invoke_args(getter, NULL, &obj, NULL)) g_blend_additive = obj;
-            }
-        }
-        LOG_INFO("BlendState.Additive = %p", g_blend_additive);
-    }
-
-    nat_begin = patchlib_method_get_pointer(g_begin9);
+    patch_handle_t texture=patchlib_type_get_type("Microsoft.Xna.Framework.Graphics","Texture2D");
+    patch_handle_t vec=patchlib_type_get_type("Microsoft.Xna.Framework","Vector2");
+    patch_handle_t rect=patchlib_type_get_type("Microsoft.Xna.Framework","Rectangle");
+    patch_handle_t color=patchlib_type_get_type("Microsoft.Xna.Framework.Graphics","Color");
+    patch_handle_t single=patchlib_type_get_type("System","Single");
+    patch_handle_t effects=patchlib_type_get_type("Microsoft.Xna.Framework.Graphics","SpriteEffects");
+    patch_handle_t types[]={texture,vec,rect,color,single,vec,vec,effects,single};
+    const char *names[]={"texture","position","srcRect","color","rotation","origin","scale","effects","layerDepth"};
+    /* Match LuaLoader's verified ref-Rectangle/Color overload. Draw has many
+     * nine-parameter overloads with incompatible native argument layouts. */
+    for(int i=0;i<9;i++) if(!types[i]) return false;
+    g_draw9=patchlib_type_get_method_by_signature(sb_type,"Draw",9,types,names);
+    if (!g_end0 || !g_draw9) return false;
     nat_draw  = patchlib_method_get_pointer(g_draw9);
-    if (!nat_begin || !nat_draw) { LOG_ERROR("取原生指针失败"); return false; }
+    if (!nat_draw) { LOG_ERROR("取原生指针失败"); return false; }
 
     /* ⚠ 贴图**不在这里**建：init_mod 发生在内核初始化阶段，那时 Unity 还没跑起来，
      *   terraria_texture2d_create → Texture2D..ctor 会让 il2cpp 直接 abort（真机实测崩溃）。
@@ -191,31 +177,12 @@ static bool draw_init(void) {
 
 /* 延迟建贴图（必须在游戏跑起来之后、游戏线程上） */
 static bool ensure_textures(void) {
-    if (g_white && g_soft) return true;
-    if (g_white || g_soft) return false;
+    if (g_white) return true;
     const unsigned char px[4] = { 255, 255, 255, 255 };
     g_white = terraria_texture2d_create(1, 1, TEXTURE_FORMAT_RGBA32, (void*)px, 4);
     if (!g_white) return false;
     if (!pin_object(g_white)) { g_white=NULL; return false; }
-    g_soft = make_texture(LIGHTS_TEX, alpha_soft);
-    return g_soft != NULL;
-}
-
-static void draw_begin_blend(void *blend) {
-    void *sb = sprite_batch();
-    if (!sb || !nat_begin) return;
-    nullable_mat_t ident; memset(&ident, 0, sizeof(ident));
-    ident.has = 1; ident.m[0] = ident.m[5] = ident.m[10] = ident.m[15] = 1.0f;
-    ((void (*)(void *, int, void *, void *, void *, void *, void *, nullable_mat_t *, bool))nat_begin)
-        (sb, 0, blend, NULL, NULL, NULL, NULL, &ident, true);
-}
-
-static void draw_begin(void) { draw_begin_blend(NULL); }
-
-static void draw_end(void) {
-    void *sb = sprite_batch();
-    if (!sb || !g_end0) return;
-    patchlib_method_invoke_args(g_end0, sb, NULL, NULL);
+    return true;
 }
 
 static void draw_tex(void *tex, float x, float y, float w, float h, float tw, float th, uint32_t rgba) {
@@ -229,33 +196,6 @@ static void draw_tex(void *tex, float x, float y, float w, float h, float tw, fl
 
 static void draw_rect(float x, float y, float w, float h, uint32_t rgba) { draw_tex(g_white, x, y, w, h, 1, 1, rgba); }
 
-/* 程序化贴图：RGB 预乘（= A），否则画出来发白 */
-static void *make_texture(int size, float (*alpha_at)(float)) {
-    unsigned char *px = (unsigned char *)malloc((size_t)size * size * 4);
-    if (!px) return NULL;
-    float half = (size - 1) * 0.5f;
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            float dx = (x - half) / half, dy = (y - half) / half;
-            float r = sqrtf(dx * dx + dy * dy); if (r > 1.0f) r = 1.0f;
-            float a = alpha_at(r); if (a < 0) a = 0; if (a > 1) a = 1;
-            unsigned char v = (unsigned char)(a * 255.0f);
-            unsigned char *p = px + ((size_t)y * size + x) * 4;
-            p[0] = v; p[1] = v; p[2] = v; p[3] = v;
-        }
-    }
-    void *tex = terraria_texture2d_create(size, size, TEXTURE_FORMAT_RGBA32, px, (size_t)size * size * 4);
-    free(px);
-    return tex;
-}
-
-/* 柔光斑衰减：指数 2.0 -> 1.6（衰减慢 20%，光铺得更开） */
-static float alpha_soft(float r) {
-    float k = 1.0f - r;
-    if (k < 0.0f) k = 0.0f;
-    k = powf(k, 1.6f);
-    return k > 1.0f ? 1.0f : k;
-}
 /* ============================ Main 取值 ============================ */
 /* PE 上 screenWidth/screenHeight/mouseX/mouseY/gameMenu 是**属性**；dayTime/time 等是字段 */
 
@@ -328,53 +268,17 @@ static bool main_bool(const char *name, bool fallback) {
 
 
 #include "world_occlusion.h"
-/* Observe the game's exact Begin arguments. Suspend and restore only a known
- * active batch; never blindly Begin or assume the UI batch transform. */
-typedef struct {
-    void *sb,*blend,*sampler,*depth,*raster,*effect;
-    int sort; bool deferred,valid,short_form; nullable_mat_t matrix;
-} batch_state;
-static batch_state observed;
+/* Never hook global SpriteBatch.Begin/End: wrapping their native ABI through
+ * the kernel FFI changes every game batch, even while this effect is idle.
+ * Borrow an active world batch untouched; own a simple Begin(2) only if closed. */
 static bool own_batch;
-static void *native_begin_short;
+static void *native_begin_short,*native_end;
+static patch_handle_t begin_called;
+static patch_hook_id_t hooks[1];
+static int hook_count;
 static void trace_skip(unsigned reason,const char *message) {
     static unsigned seen[8];
     if(reason<8 && (++seen[reason]==1 || seen[reason]%3600==0)) LOG_INFO("绘制暂缓[%u] %s",reason,message);
-}
-static patch_handle_t begin_called;
-static patch_hook_id_t hooks[4];
-static int hook_count;
-static void observe_begin(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
-    (void)result;(void)sig;
-    if(own_batch || !args) return;
-    for(int i=0;i<8;i++) if(!args[i]) { observed.valid=false;return; }
-    observed.sb=instance; observed.sort=*(int*)args[0];
-    observed.blend=*(void**)args[1]; observed.sampler=*(void**)args[2];
-    observed.depth=*(void**)args[3]; observed.raster=*(void**)args[4];
-    observed.effect=*(void**)args[5];
-    /* Nullable<Matrix> is a GENERICINST and this kernel marshals it as a
-     * pointer. args[6] holds that pointer, not 68 bytes of matrix contents. */
-    const nullable_mat_t *matrix=*(nullable_mat_t**)args[6];
-    if(!matrix) {observed.valid=false;return;}
-    memcpy(&observed.matrix,matrix,sizeof(nullable_mat_t));
-    observed.deferred=*(bool*)args[7]; observed.valid=true;observed.short_form=false;
-}
-static void observe_short_begin(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
-    (void)result;(void)sig;
-    if(own_batch || !args || !args[0] || !args[1]) return;
-    observed.sb=instance;observed.sort=*(int*)args[0];
-    observed.deferred=*(bool*)args[1];observed.short_form=true;observed.valid=true;
-}
-static void observe_end(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
-    (void)args;(void)result;(void)sig;
-    if(!own_batch && observed.sb==instance) observed.valid=false;
-}
-static void restore_batch(const batch_state *s) {
-    if(s->short_form) {
-        ((void(*)(void*,int,bool))native_begin_short)(s->sb,s->sort,s->deferred);return;
-    }
-    ((void (*)(void*,int,void*,void*,void*,void*,void*,nullable_mat_t*,bool))nat_begin)
-        (s->sb,s->sort,s->blend,s->sampler,s->depth,s->raster,s->effect,(nullable_mat_t*)&s->matrix,s->deferred);
 }
 /* PE uses virtual screen dimensions for zoom. screenPosition is the world
  * origin of that virtual viewport. Do not apply GameViewMatrix a second time. */
@@ -445,14 +349,12 @@ static void render_world(int sw,int sh,float cx,float cy,const float m[16],bool 
         float x=(grid[i].x*16.f-cx)*zx+m[12],y=(grid[i].y*16.f-cy)*zy+m[13];
         draw_rect(x,y,16.f*zx+0.25f,16.f*zy+0.25f,0x080f2000u|(uint32_t)(clamp01(a)*255));
     }
-    if(g_blend_additive) {
-        draw_end();draw_begin_blend(g_blend_additive);
+    {
         float strength=day?(0.07f+0.03f*lift):0.025f;
         uint32_t rgb=day?0xffdcaa00u:0x99bbee00u;
         for(int i=0;i<grid_count;i++) if(grid[i].rim) {
             float x=(grid[i].x*16.f-cx)*zx+m[12];
             float base=(grid[i].y*16.f-cy)*zy+m[13];
-            /* Four strips approximate a slope without outlining empty pixels. */
             for(int k=0;k<4;k++) {
                 float y=base+tile_surface(grid[i].header,(k+0.5f)/4.f)*16.f*zy;
                 draw_rect(x+k*4.f*zx,y,4.f*zx+0.1f,1.5f*zy,rgb|(uint32_t)(strength*255));
@@ -469,35 +371,39 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
     if(!sb || !begin_called) {trace_skip(1,"SpriteBatch尚未就绪");return false;}
     unsigned char *active=patchlib_field_get_pointer(begin_called,sb);
     if(!active) {trace_skip(2,"无法读取批次状态");return false;}
-    bool resume=*active!=0;
-    if(resume && (!observed.valid || observed.sb!=sb)) {trace_skip(3,"当前批次尚未捕获，等待下一个Begin");return false;}
+    bool borrowed=*active!=0;
     int sw=main_int("screenWidth",0),sh=main_int("screenHeight",0);
     float cx,cy,m[16];
     if(sw<=0 || sh<=0 || !main_vec2("screenPosition",&cx,&cy)) {trace_skip(4,"无法读取虚拟视口/相机");return false;}
     virtual_view_matrix(m);
     cache_tile_flags();if(!solid_count) {trace_skip(5,"方块属性数组尚未缓存");return false;}
-    batch_state saved=observed;
     own_batch=true;
-    if(resume) draw_end();
+    static bool first_world=true;
+    if(first_world) LOG_INFO("首次世界绘制：读取完成，已有批次=%d",(int)borrowed);
+    /* Texture creation is independent of SpriteBatch state and stays on this
+     * game callback, after world load. Never End the game's active batch. */
     if(ensure_textures()) {
-        draw_begin();g_frames++;
+        if(first_world) LOG_INFO("首次世界绘制：贴图就绪");
+        if(!borrowed) ((void(*)(void*,int,bool))native_begin_short)(sb,0,true);
+        g_frames++;
         bool day=main_bool("dayTime",true);
         float t=main_double("time",0)/(day?54000.f:32400.f);
         render_world(sw,sh,cx,cy,m,day,t);
-        draw_end();
-        if(g_frames==1 || g_frames%600==0) LOG_INFO("v1.1 帧=%d 遮挡格=%d 屏幕=%dx%d",g_frames,grid_count,sw,sh);
+        if(!borrowed) ((void(*)(void*))native_end)(sb);
+        if(first_world || g_frames%600==0) LOG_INFO("v1.1.3 绘制完成：帧=%d 遮挡格=%d 屏幕=%dx%d 借用批次=%d",g_frames,grid_count,sw,sh,(int)borrowed);
+        first_world=false;
     } else trace_skip(6,"贴图创建或GC引用失败");
-    if(resume) restore_batch(&saved);
     own_batch=false;
     return false;
 }
-static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=4,.api_version=1,.version="1.1.2"};
+static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=5,.api_version=1,.version="1.1.3"};
 static void init_mod(kernel_mod_handle_t *handle) {
     runtime_log_init(handle);
-    LOG_INFO("v1.1.2 init entry");
+    LOG_INFO("v1.1.3 init entry");
     bool api_ok=true;
 #define REQUIRE_API(name) do { if(!(name)) {LOG_ERROR("缺少必需内核接口: %s",#name);api_ok=false;} } while(0)
     REQUIRE_API(patchlib_type_get_type);REQUIRE_API(patchlib_type_get_field);
+    REQUIRE_API(patchlib_type_get_method_by_signature);
     REQUIRE_API(patchlib_field_get_pointer);REQUIRE_API(patchlib_type_get_method_by_param_count);
     REQUIRE_API(patchlib_method_get_pointer);REQUIRE_API(patchlib_method_invoke_args);
     REQUIRE_API(patchlib_install_prepost_hook);REQUIRE_API(patchlib_uninstall_hook);
@@ -512,27 +418,24 @@ static void init_mod(kernel_mod_handle_t *handle) {
     begin_called=patchlib_type_get_field(sb,"_beginCalled");
     patch_handle_t ui=patchlib_type_get_method_by_param_count(g_main_type,"DrawInterface",1);
     if(!begin_called || !ui) {LOG_ERROR("必需的世界/UI接口缺失，停止绘制");return;}
-    hooks[hook_count++]=patchlib_install_prepost_hook(g_begin9,NULL,observe_begin);
-    hooks[hook_count++]=patchlib_install_prepost_hook(g_end0,NULL,observe_end);
     patch_handle_t short_begin=patchlib_type_get_method_by_param_count(sb,"Begin",2);
-    if(short_begin) {
-        native_begin_short=patchlib_method_get_pointer(short_begin);
-        if(native_begin_short) hooks[hook_count++]=patchlib_install_prepost_hook(short_begin,NULL,observe_short_begin);
-    }
+    native_begin_short=short_begin?patchlib_method_get_pointer(short_begin):NULL;
+    native_end=patchlib_method_get_pointer(g_end0);
+    if(!native_begin_short || !native_end) {LOG_ERROR("简单批次接口缺失");return;}
     hooks[hook_count++]=patchlib_install_prepost_hook(ui,before_interface,NULL);
     for(int i=0;i<hook_count;i++) if(hooks[i]==PATCH_HOOK_INVALID_ID) {
         LOG_ERROR("绘制 hook 安装失败");
         for(int j=0;j<hook_count;j++) if(hooks[j]!=PATCH_HOOK_INVALID_ID) patchlib_uninstall_hook(hooks[j]);
         hook_count=0;return;
     }
-    LOG_INFO("v1.1.2 初始化完成：世界阴影位于UI之前，保留原版明暗");
+    LOG_INFO("v1.1.3 初始化完成：世界阴影位于UI之前，保留原版明暗");
 }
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;
     for(int i=0;i<hook_count;i++) patchlib_uninstall_hook(hooks[i]);
     hook_count=0;
     if(g_gchandle_free) for(int i=0;i<root_count;i++) g_gchandle_free(texture_roots[i]);
-    root_count=0;g_white=NULL;g_soft=NULL;observed.valid=false;had_camera=false;
+    root_count=0;g_white=NULL;had_camera=false;
 }
 static kernel_mod_info_t *get_info(void) {return (kernel_mod_info_t*)&g_info;}
 __attribute__((visibility("default"))) kernel_mod_ops_t *create_kernel_mod(void) {

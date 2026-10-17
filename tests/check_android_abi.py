@@ -9,6 +9,7 @@ required = {
     'create_kernel_mod': 'FUNC',
     'mod_logger_write': 'OBJECT',
     'patchlib_type_get_type': 'OBJECT',
+    'patchlib_type_get_method_by_signature': 'OBJECT',
     'patchlib_field_get_pointer': 'OBJECT',
     'patchlib_method_get_pointer': 'OBJECT',
     'patchlib_install_prepost_hook': 'OBJECT',

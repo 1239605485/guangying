@@ -16,7 +16,7 @@ jobs:
           /tmp/lighting-test
           cc -D__ANDROID__ -std=c11 -Wall -Wextra -Werror tests/occlusion_cache_test.c tefkernel/tef_api_imp.c -lm -o /tmp/occlusion-test
           /tmp/occlusion-test
-          cc -D_GNU_SOURCE -D__ANDROID__ -std=c11 -Wall -Wextra -Werror -Ixdl/include -ffunction-sections -fdata-sections tests/batch_capture_test.c tefkernel/tef_api_imp.c -Wl,--gc-sections -lm -ldl -o /tmp/batch-test
+          cc -D_GNU_SOURCE -D__ANDROID__ -std=c11 -Wall -Wextra -Werror -Ixdl/include -ffunction-sections -fdata-sections tests/world_batch_test.c tefkernel/tef_api_imp.c -Wl,--gc-sections -lm -ldl -o /tmp/batch-test
           /tmp/batch-test
       - name: Install Android NDK
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.2.12479018' > /dev/null
@@ -34,10 +34,10 @@ jobs:
         run: |
           mkdir -p Package/Resources/lib dist
           cp build/libLightsAndShadows.so Package/Resources/lib/libLightsAndShadows.android.arm64.so
-          (cd Package && zip -r ../dist/LightsAndShadows-1.1.2-Android-arm64.zip .)
-          git archive --format=zip -o dist/LightsAndShadows-1.1.2-source.zip HEAD
+          (cd Package && zip -r ../dist/LightsAndShadows-1.1.3-Android-arm64.zip .)
+          git archive --format=zip -o dist/LightsAndShadows-1.1.3-source.zip HEAD
       - uses: actions/upload-artifact@v4
         with:
-          name: LightsAndShadows-1.1.2
+          name: LightsAndShadows-1.1.3
           path: dist/*.zip
           if-no-files-found: error
