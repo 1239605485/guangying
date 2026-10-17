@@ -14,11 +14,15 @@ static void cache_tile_flags(void) {
     void **s=solid_field?patchlib_field_get_pointer(solid_field,NULL):NULL;
     void **t=top_field?patchlib_field_get_pointer(top_field,NULL):NULL;
     if(!s || !t || !*s || !*t) { solid_count=0; return; }
-    if(*s==last_solid && *t==last_top) return;
+    if(solid_count && *s==last_solid && *t==last_top) return;
     size_t n=patchlib_array_length(*s), m=patchlib_array_length(*t);
     if(!n || n>sizeof(solid_cache) || m!=n) { solid_count=0; return; }
-    if(!patchlib_array_copy_to_c(solid_cache,*s,n) ||
-       !patchlib_array_copy_to_c(top_cache,*t,n)) { solid_count=0; return; }
+    /* TEFKernel 1.1.1 registers array_at/length, but NOT copy_to_c.
+     * Read once when the arrays change; no unsupported bulk API dependency. */
+    for(size_t i=0;i<n;i++) {
+        if(!patchlib_array_at(*s,i,&solid_cache[i]) ||
+           !patchlib_array_at(*t,i,&top_cache[i])) { solid_count=0; return; }
+    }
     solid_count=n; last_solid=*s; last_top=*t;
 }
 /* -1 means unavailable, distinct from dirt (type zero) and air. */

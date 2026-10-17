@@ -12,7 +12,7 @@ required = {
     'patchlib_field_get_pointer': 'OBJECT',
     'patchlib_method_get_pointer': 'OBJECT',
     'patchlib_install_prepost_hook': 'OBJECT',
-    'patchlib_array_copy_to_c': 'OBJECT',
+    'patchlib_array_at': 'OBJECT',
     'terraria_texture2d_create': 'OBJECT',
 }
 for name, kind in required.items():

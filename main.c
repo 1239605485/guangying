@@ -10,6 +10,8 @@
 #include <dlfcn.h>
 #include "xdl.h"   /* MIT: HexHacking Team —— dlopen 拿不到时的符号查找回退 */
 #include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,8 +23,30 @@
  * It MUST stay exported even if internal implementation visibility changes. */
 __attribute__((visibility("default"))) void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt, ...) = NULL;
 
-#define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
-#define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
+static char runtime_log_path[1024];
+static void runtime_log(mod_log_level_t level,const char *fmt,...) {
+    char text[2048];va_list ap;va_start(ap,fmt);vsnprintf(text,sizeof(text),fmt,ap);va_end(ap);
+    if(mod_logger_write) mod_logger_write(level,"LightsAndShadows","%s",text);
+    if(runtime_log_path[0]) {
+        FILE *f=fopen(runtime_log_path,"a");
+        if(f) { fprintf(f,"[%ld] [%d] %s\n",(long)time(NULL),(int)level,text);fclose(f); }
+    }
+}
+static void runtime_log_init(const kernel_mod_handle_t *handle) {
+    if(!handle || !handle->private_dir) return;
+    /* Put this mod's log beside kernel logs so TEFManager's log export finds it. */
+    const char *cut=strstr(handle->private_dir,"/mods/");
+    if(cut) snprintf(runtime_log_path,sizeof(runtime_log_path),"%.*s/logs/tefkernel/lightsandshadows_runtime.log",(int)(cut-handle->private_dir),handle->private_dir);
+    else snprintf(runtime_log_path,sizeof(runtime_log_path),"%s/lightsandshadows_runtime.log",handle->private_dir);
+    FILE *f=fopen(runtime_log_path,"w");
+    if(!f && cut) {
+        snprintf(runtime_log_path,sizeof(runtime_log_path),"%s/lightsandshadows_runtime.log",handle->private_dir);
+        f=fopen(runtime_log_path,"w");
+    }
+    if(f) fclose(f);
+}
+#define LOG_INFO(...) runtime_log(MOD_LOG_LEVEL_INFO,__VA_ARGS__)
+#define LOG_ERROR(...) runtime_log(MOD_LOG_LEVEL_ERROR,__VA_ARGS__)
 
 /* ============================ 绘制层 ============================ */
 
@@ -308,10 +332,15 @@ static bool main_bool(const char *name, bool fallback) {
  * active batch; never blindly Begin or assume the UI batch transform. */
 typedef struct {
     void *sb,*blend,*sampler,*depth,*raster,*effect;
-    int sort; bool deferred,valid; nullable_mat_t matrix;
+    int sort; bool deferred,valid,short_form; nullable_mat_t matrix;
 } batch_state;
 static batch_state observed;
 static bool own_batch;
+static void *native_begin_short;
+static void trace_skip(unsigned reason,const char *message) {
+    static unsigned seen[8];
+    if(reason<8 && (++seen[reason]==1 || seen[reason]%3600==0)) LOG_INFO("绘制暂缓[%u] %s",reason,message);
+}
 static patch_handle_t begin_called;
 static patch_hook_id_t hooks[4];
 static int hook_count;
@@ -322,18 +351,28 @@ static void observe_begin(patch_handle_t instance,void **args,void *result,const
     observed.sb=instance; observed.sort=*(int*)args[0];
     observed.blend=*(void**)args[1]; observed.sampler=*(void**)args[2];
     observed.depth=*(void**)args[3]; observed.raster=*(void**)args[4];
-    observed.effect=*(void**)args[5]; memcpy(&observed.matrix,args[6],sizeof(nullable_mat_t));
-    observed.deferred=*(bool*)args[7]; observed.valid=true;
+    observed.effect=*(void**)args[5];
+    /* Nullable<Matrix> is a GENERICINST and this kernel marshals it as a
+     * pointer. args[6] holds that pointer, not 68 bytes of matrix contents. */
+    const nullable_mat_t *matrix=*(nullable_mat_t**)args[6];
+    if(!matrix) {observed.valid=false;return;}
+    memcpy(&observed.matrix,matrix,sizeof(nullable_mat_t));
+    observed.deferred=*(bool*)args[7]; observed.valid=true;observed.short_form=false;
 }
 static void observe_short_begin(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
-    (void)instance;(void)args;(void)result;(void)sig;
-    if(!own_batch) observed.valid=false;
+    (void)result;(void)sig;
+    if(own_batch || !args || !args[0] || !args[1]) return;
+    observed.sb=instance;observed.sort=*(int*)args[0];
+    observed.deferred=*(bool*)args[1];observed.short_form=true;observed.valid=true;
 }
 static void observe_end(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
     (void)args;(void)result;(void)sig;
     if(!own_batch && observed.sb==instance) observed.valid=false;
 }
 static void restore_batch(const batch_state *s) {
+    if(s->short_form) {
+        ((void(*)(void*,int,bool))native_begin_short)(s->sb,s->sort,s->deferred);return;
+    }
     ((void (*)(void*,int,void*,void*,void*,void*,void*,nullable_mat_t*,bool))nat_begin)
         (s->sb,s->sort,s->blend,s->sampler,s->depth,s->raster,s->effect,(nullable_mat_t*)&s->matrix,s->deferred);
 }
@@ -427,16 +466,16 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
     if(own_batch) return false;
     if(main_bool("showSplash",true) || main_bool("gameMenu",true) || main_bool("mapFullscreen",false)) { had_camera=false; return false; }
     void *sb=sprite_batch();
-    if(!sb || !begin_called) return false;
+    if(!sb || !begin_called) {trace_skip(1,"SpriteBatch尚未就绪");return false;}
     unsigned char *active=patchlib_field_get_pointer(begin_called,sb);
-    if(!active) return false;
+    if(!active) {trace_skip(2,"无法读取批次状态");return false;}
     bool resume=*active!=0;
-    if(resume && (!observed.valid || observed.sb!=sb)) return false;
+    if(resume && (!observed.valid || observed.sb!=sb)) {trace_skip(3,"当前批次尚未捕获，等待下一个Begin");return false;}
     int sw=main_int("screenWidth",0),sh=main_int("screenHeight",0);
     float cx,cy,m[16];
-    if(sw<=0 || sh<=0 || !main_vec2("screenPosition",&cx,&cy)) return false;
+    if(sw<=0 || sh<=0 || !main_vec2("screenPosition",&cx,&cy)) {trace_skip(4,"无法读取虚拟视口/相机");return false;}
     virtual_view_matrix(m);
-    cache_tile_flags();if(!solid_count) return false;
+    cache_tile_flags();if(!solid_count) {trace_skip(5,"方块属性数组尚未缓存");return false;}
     batch_state saved=observed;
     own_batch=true;
     if(resume) draw_end();
@@ -447,22 +486,27 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
         render_world(sw,sh,cx,cy,m,day,t);
         draw_end();
         if(g_frames==1 || g_frames%600==0) LOG_INFO("v1.1 帧=%d 遮挡格=%d 屏幕=%dx%d",g_frames,grid_count,sw,sh);
-    }
+    } else trace_skip(6,"贴图创建或GC引用失败");
     if(resume) restore_batch(&saved);
     own_batch=false;
     return false;
 }
-static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=3,.api_version=1,.version="1.1.1"};
+static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=4,.api_version=1,.version="1.1.2"};
 static void init_mod(kernel_mod_handle_t *handle) {
-    (void)handle;
-    LOG_INFO("v1.1.1 init entry");
-    if(!patchlib_type_get_type || !patchlib_type_get_field || !patchlib_field_get_pointer ||
-       !patchlib_type_get_method_by_param_count || !patchlib_method_get_pointer ||
-       !patchlib_method_invoke_args || !patchlib_install_prepost_hook || !patchlib_uninstall_hook ||
-       !patchlib_is_valid || !patchlib_array_length || !patchlib_array_copy_to_c ||
-       !terraria_texture2d_create) { LOG_ERROR("必需的内核API未注入，停止初始化");return; }
+    runtime_log_init(handle);
+    LOG_INFO("v1.1.2 init entry");
+    bool api_ok=true;
+#define REQUIRE_API(name) do { if(!(name)) {LOG_ERROR("缺少必需内核接口: %s",#name);api_ok=false;} } while(0)
+    REQUIRE_API(patchlib_type_get_type);REQUIRE_API(patchlib_type_get_field);
+    REQUIRE_API(patchlib_field_get_pointer);REQUIRE_API(patchlib_type_get_method_by_param_count);
+    REQUIRE_API(patchlib_method_get_pointer);REQUIRE_API(patchlib_method_invoke_args);
+    REQUIRE_API(patchlib_install_prepost_hook);REQUIRE_API(patchlib_uninstall_hook);
+    REQUIRE_API(patchlib_is_valid);REQUIRE_API(patchlib_array_length);
+    REQUIRE_API(patchlib_array_at);REQUIRE_API(terraria_texture2d_create);
+#undef REQUIRE_API
+    if(!api_ok) return;
     g_main_type=patchlib_type_get_type("Terraria","Main");
-    if(!g_main_type || !draw_init()) return;
+    if(!g_main_type || !draw_init()) {LOG_ERROR("Main/SpriteBatch接口解析失败");return;}
     occlusion_init();
     patch_handle_t sb=patchlib_type_get_type("Microsoft.Xna.Framework.Graphics","SpriteBatch");
     begin_called=patchlib_type_get_field(sb,"_beginCalled");
@@ -471,14 +515,17 @@ static void init_mod(kernel_mod_handle_t *handle) {
     hooks[hook_count++]=patchlib_install_prepost_hook(g_begin9,NULL,observe_begin);
     hooks[hook_count++]=patchlib_install_prepost_hook(g_end0,NULL,observe_end);
     patch_handle_t short_begin=patchlib_type_get_method_by_param_count(sb,"Begin",2);
-    if(short_begin) hooks[hook_count++]=patchlib_install_prepost_hook(short_begin,NULL,observe_short_begin);
+    if(short_begin) {
+        native_begin_short=patchlib_method_get_pointer(short_begin);
+        if(native_begin_short) hooks[hook_count++]=patchlib_install_prepost_hook(short_begin,NULL,observe_short_begin);
+    }
     hooks[hook_count++]=patchlib_install_prepost_hook(ui,before_interface,NULL);
     for(int i=0;i<hook_count;i++) if(hooks[i]==PATCH_HOOK_INVALID_ID) {
         LOG_ERROR("绘制 hook 安装失败");
         for(int j=0;j<hook_count;j++) if(hooks[j]!=PATCH_HOOK_INVALID_ID) patchlib_uninstall_hook(hooks[j]);
         hook_count=0;return;
     }
-    LOG_INFO("v1.1.1 初始化完成：世界阴影位于UI之前，保留原版明暗");
+    LOG_INFO("v1.1.2 初始化完成：世界阴影位于UI之前，保留原版明暗");
 }
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;
