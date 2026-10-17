@@ -24,14 +24,16 @@ jobs:
           -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24
       - name: Compile
         run: cmake --build build --parallel 2
+      - name: Verify loader ABI exports
+        run: python3 tests/check_android_abi.py build/libLightsAndShadows.so
       - name: Package installable mod and sources
         run: |
           mkdir -p Package/Resources/lib dist
           cp build/libLightsAndShadows.so Package/Resources/lib/libLightsAndShadows.android.arm64.so
-          (cd Package && zip -r ../dist/LightsAndShadows-1.1.0-Android-arm64.zip .)
-          git archive --format=zip -o dist/LightsAndShadows-1.1.0-source.zip HEAD
+          (cd Package && zip -r ../dist/LightsAndShadows-1.1.1-Android-arm64.zip .)
+          git archive --format=zip -o dist/LightsAndShadows-1.1.1-source.zip HEAD
       - uses: actions/upload-artifact@v4
         with:
-          name: LightsAndShadows-1.1.0
+          name: LightsAndShadows-1.1.1
           path: dist/*.zip
           if-no-files-found: error

@@ -17,8 +17,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 内核注入的日志函数（mod_logger.h 约定） */
-void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt, ...) = NULL;
+/* KernelLoader injects this slot by dlsym before init_mod.
+ * It MUST stay exported even if internal implementation visibility changes. */
+__attribute__((visibility("default"))) void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt, ...) = NULL;
 
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
@@ -311,7 +312,7 @@ typedef struct {
 } batch_state;
 static batch_state observed;
 static bool own_batch;
-static patch_handle_t begin_called, view_field, view_matrix_getter;
+static patch_handle_t begin_called;
 static patch_hook_id_t hooks[4];
 static int hook_count;
 static void observe_begin(patch_handle_t instance,void **args,void *result,const patch_method_signature_t *sig) {
@@ -336,12 +337,10 @@ static void restore_batch(const batch_state *s) {
     ((void (*)(void*,int,void*,void*,void*,void*,void*,nullable_mat_t*,bool))nat_begin)
         (s->sb,s->sort,s->blend,s->sampler,s->depth,s->raster,s->effect,(nullable_mat_t*)&s->matrix,s->deferred);
 }
-static bool world_matrix(float m[16]) {
-    void **slot=view_field?patchlib_field_get_pointer(view_field,NULL):NULL;
-    if(!slot || !*slot || !view_matrix_getter) return false;
-    if(!patchlib_method_invoke_args(view_matrix_getter,*slot,m,NULL)) return false;
-    for(int i=0;i<16;i++) if(!isfinite(m[i])) return false;
-    return fabsf(m[0])>0.01f && fabsf(m[5])>0.01f && fabsf(m[1])+fabsf(m[4])<0.001f;
+/* PE uses virtual screen dimensions for zoom. screenPosition is the world
+ * origin of that virtual viewport. Do not apply GameViewMatrix a second time. */
+static void virtual_view_matrix(float m[16]) {
+    memset(m,0,16*sizeof(float));m[0]=m[5]=m[10]=m[15]=1.f;
 }
 /* Sparse world-space grid: bounded ray budget, no per-frame texture upload.
  * Each cell is classified independently, so entering a house never toggles
@@ -435,7 +434,8 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
     if(resume && (!observed.valid || observed.sb!=sb)) return false;
     int sw=main_int("screenWidth",0),sh=main_int("screenHeight",0);
     float cx,cy,m[16];
-    if(sw<=0 || sh<=0 || !main_vec2("screenPosition",&cx,&cy) || !world_matrix(m)) return false;
+    if(sw<=0 || sh<=0 || !main_vec2("screenPosition",&cx,&cy)) return false;
+    virtual_view_matrix(m);
     cache_tile_flags();if(!solid_count) return false;
     batch_state saved=observed;
     own_batch=true;
@@ -452,19 +452,22 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
     own_batch=false;
     return false;
 }
-static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=2,.api_version=1,.version="1.1.0"};
+static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=3,.api_version=1,.version="1.1.1"};
 static void init_mod(kernel_mod_handle_t *handle) {
     (void)handle;
+    LOG_INFO("v1.1.1 init entry");
+    if(!patchlib_type_get_type || !patchlib_type_get_field || !patchlib_field_get_pointer ||
+       !patchlib_type_get_method_by_param_count || !patchlib_method_get_pointer ||
+       !patchlib_method_invoke_args || !patchlib_install_prepost_hook || !patchlib_uninstall_hook ||
+       !patchlib_is_valid || !patchlib_array_length || !patchlib_array_copy_to_c ||
+       !terraria_texture2d_create) { LOG_ERROR("必需的内核API未注入，停止初始化");return; }
     g_main_type=patchlib_type_get_type("Terraria","Main");
     if(!g_main_type || !draw_init()) return;
     occlusion_init();
     patch_handle_t sb=patchlib_type_get_type("Microsoft.Xna.Framework.Graphics","SpriteBatch");
     begin_called=patchlib_type_get_field(sb,"_beginCalled");
-    view_field=patchlib_type_get_field(g_main_type,"GameViewMatrix");
-    patch_handle_t view=patchlib_type_get_type("Terraria.Graphics","SpriteViewMatrix");
-    view_matrix_getter=view?patchlib_type_get_method_by_param_count(view,"get_TransformationMatrix",0):NULL;
     patch_handle_t ui=patchlib_type_get_method_by_param_count(g_main_type,"DrawInterface",1);
-    if(!begin_called || !view_field || !view_matrix_getter || !ui) {LOG_ERROR("必需的世界/UI接口缺失，停止绘制");return;}
+    if(!begin_called || !ui) {LOG_ERROR("必需的世界/UI接口缺失，停止绘制");return;}
     hooks[hook_count++]=patchlib_install_prepost_hook(g_begin9,NULL,observe_begin);
     hooks[hook_count++]=patchlib_install_prepost_hook(g_end0,NULL,observe_end);
     patch_handle_t short_begin=patchlib_type_get_method_by_param_count(sb,"Begin",2);
@@ -475,7 +478,7 @@ static void init_mod(kernel_mod_handle_t *handle) {
         for(int j=0;j<hook_count;j++) if(hooks[j]!=PATCH_HOOK_INVALID_ID) patchlib_uninstall_hook(hooks[j]);
         hook_count=0;return;
     }
-    LOG_INFO("v1.1.0 初始化完成：世界阴影位于UI之前，保留原版明暗");
+    LOG_INFO("v1.1.1 初始化完成：世界阴影位于UI之前，保留原版明暗");
 }
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;
@@ -486,6 +489,6 @@ static void cleanup_mod(kernel_mod_handle_t *handle) {
 }
 static kernel_mod_info_t *get_info(void) {return (kernel_mod_info_t*)&g_info;}
 __attribute__((visibility("default"))) kernel_mod_ops_t *create_kernel_mod(void) {
-    static kernel_mod_ops_t ops;
-    ops.init_mod=init_mod;ops.cleanup_mod=cleanup_mod;ops.get_info=get_info;return &ops;
+    static kernel_mod_ops_t ops={.init_mod=init_mod,.cleanup_mod=cleanup_mod,.get_info=get_info};
+    return &ops;
 }

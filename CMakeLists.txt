@@ -18,7 +18,8 @@ target_include_directories(LightsAndShadows PRIVATE xdl/include)
 target_link_directories(LightsAndShadows PUBLIC ./mod-api ./tefkernel)
 target_link_libraries(LightsAndShadows xdl m dl log)
 
-set_target_properties(LightsAndShadows PROPERTIES C_VISIBILITY_PRESET hidden)
+# KernelLoader injects function pointers by dynamic symbol name.
+# Keep mod_logger_write and all SDK injection slots publicly visible.
 target_compile_definitions(LightsAndShadows PRIVATE _GNU_SOURCE)
 target_compile_options(LightsAndShadows PRIVATE -Wall -Wextra -Werror=implicit-function-declaration)
 target_link_options(LightsAndShadows PRIVATE -Wl,--no-undefined)
