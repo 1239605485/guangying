@@ -29,9 +29,23 @@
  *******************************************************************************/
 
 #define TEF_API_IMPL 1
+
 #include "tef_api.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
+#include "patchlib/property.h"
 #include "patchlib/type.h"
 #include "patchlib/struct/array.h"
+#include "patchlib/struct/dictionary.h"
+#include "patchlib/struct/string.h"
+#include "patchlib/struct/list.h"
+#include "tefstd/vector.h"
+#include "tefstd/hashmap.h"
+#include "tefstd/skipmap.h"
+#include "memdl/memdl.h"
+#include "modloader/modloader_core.h"
+#include "module/module_core.h"
+#include "tefpackage/tefpkg.h"
+#include "tefplugin/tpf_core.h"
+#include "terraria/main.h"
 #include "terraria/texture2d.h"

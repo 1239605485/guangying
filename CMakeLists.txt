@@ -1,25 +1,20 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 4.2)
 project(LightsAndShadows)
 
 set(CMAKE_C_STANDARD 11)
 
 # xDL（MIT，© 2020-2025 HexHacking Team）：Android 符号查找回退。
-# 普通 dlopen 拿不到 libil2cpp.so（RTLD_LOCAL 加载、不在搜索路径），
-# xdl 从 /proc/self/maps 找到已映射的 ELF 再解析符号 —— LuaLoader 就是这么拿到
-# il2cpp_gchandle_new 并给纹理钉 GC 根的。
+# 当前 GL 技术线已不建 Unity 贴图（不需要 il2cpp_gchandle_new），保留 xdl 只是
+# 为以后可能要用 il2cpp 符号留的口子；不引用任何符号时静态库不会拉进产物。
 add_subdirectory(xdl)
 set_target_properties(xdl PROPERTIES C_VISIBILITY_PRESET hidden)
 
+# EGL / GLESv2：GL 后处理（eglSwapBuffers 钩子 + 自己的着色器）。
+# 必须真的链上，否则产物没有 DT_NEEDED，dlopen 时找不到 eglSwapBuffers。
 add_library(LightsAndShadows SHARED
         main.c
         tefkernel/tef_api_imp.c
 )
 target_include_directories(LightsAndShadows PRIVATE xdl/include)
 target_link_directories(LightsAndShadows PUBLIC ./mod-api ./tefkernel)
-target_link_libraries(LightsAndShadows xdl m dl log)
-
-# KernelLoader injects function pointers by dynamic symbol name.
-# Keep mod_logger_write and all SDK injection slots publicly visible.
-target_compile_definitions(LightsAndShadows PRIVATE _GNU_SOURCE)
-target_compile_options(LightsAndShadows PRIVATE -Wall -Wextra -Werror=implicit-function-declaration)
-target_link_options(LightsAndShadows PRIVATE -Wl,--no-undefined)
+target_link_libraries(LightsAndShadows xdl m dl log EGL GLESv2)
