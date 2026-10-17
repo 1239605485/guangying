@@ -18,7 +18,7 @@ zip -qr "$DIR/../dist/光影(LightsAndShadows)v1.0.0.zip" Info.json Manifest.jso
 cd "$DIR"
 rm -f "$DIR/../dist/光影(LightsAndShadows)-源码-v1.0.0.zip"
 zip -qr "$DIR/../dist/光影(LightsAndShadows)-源码-v1.0.0.zip" \
-       main.c CMakeLists.txt Package mod-api tefkernel xdl LICENSES
+       main.c CMakeLists.txt LICENSE Package mod-api tefkernel xdl LICENSES
 
 echo "== 完成 =="
 ls -la "$DIR/Package/Resources/lib/"
