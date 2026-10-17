@@ -1,0 +1,29 @@
+{
+  "pkgId": "lzup.lightsandshadows",
+  "name": "光影 Lights And Shadows",
+  "author": "lzup",
+  "description": "世界方向阴影、地形遮挡与接触阴影。光影在UI之前绘制，保留原版环境光，支持相机缩放。",
+  "version": "1.1.0",
+  "versionCode": 2,
+  "detailedInformationURL": "",
+  "updateURL": "",
+  "dependence": [],
+  "support": {
+    "android": {
+      "arm64": true,
+      "arm": false
+    },
+    "windows": {
+      "x64": false,
+      "x86": false
+    },
+    "linux": {
+      "x64": false,
+      "x86": false
+    },
+    "mac": {
+      "x64": false,
+      "x86": false
+    }
+  }
+}
