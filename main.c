@@ -228,8 +228,10 @@ static int main_int(const char *name, int fallback) {
     if (main_static_slot(name, &slot)) return *(int *)slot;
     patch_handle_t g = main_getter(name);
     if (g && patchlib_is_valid(g)) {
-        int out = fallback;
-        if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return out;
+        /* ffi_call expands small integer returns to ffi_arg (one machine word).
+         * A 4-byte int here overlaps the ARM64 stack canary in Release builds. */
+        intptr_t out = fallback;
+        if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return (int)out;
     }
     return fallback;
 }
@@ -260,7 +262,8 @@ static bool main_bool(const char *name, bool fallback) {
     if (main_static_slot(name, &slot)) return *(unsigned char *)slot != 0;
     patch_handle_t g = main_getter(name);
     if (g && patchlib_is_valid(g)) {
-        int out = fallback ? 1 : 0;
+        /* Boolean FFI returns also require a full ffi_arg-sized buffer. */
+        uintptr_t out = fallback ? 1u : 0u;
         if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return out != 0;
     }
     return fallback;
@@ -390,16 +393,16 @@ static bool before_interface(patch_handle_t instance,void **args,const patch_met
         float t=main_double("time",0)/(day?54000.f:32400.f);
         render_world(sw,sh,cx,cy,m,day,t);
         if(!borrowed) ((void(*)(void*))native_end)(sb);
-        if(first_world || g_frames%600==0) LOG_INFO("v1.1.3 绘制完成：帧=%d 遮挡格=%d 屏幕=%dx%d 借用批次=%d",g_frames,grid_count,sw,sh,(int)borrowed);
+        if(first_world || g_frames%600==0) LOG_INFO("v1.1.4 绘制完成：帧=%d 遮挡格=%d 屏幕=%dx%d 借用批次=%d",g_frames,grid_count,sw,sh,(int)borrowed);
         first_world=false;
     } else trace_skip(6,"贴图创建或GC引用失败");
     own_batch=false;
     return false;
 }
-static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=5,.api_version=1,.version="1.1.3"};
+static const kernel_mod_info_t g_info={.pkg_id="lzup.lightsandshadows",.version_code=6,.api_version=1,.version="1.1.4"};
 static void init_mod(kernel_mod_handle_t *handle) {
     runtime_log_init(handle);
-    LOG_INFO("v1.1.3 init entry");
+    LOG_INFO("v1.1.4 init entry");
     bool api_ok=true;
 #define REQUIRE_API(name) do { if(!(name)) {LOG_ERROR("缺少必需内核接口: %s",#name);api_ok=false;} } while(0)
     REQUIRE_API(patchlib_type_get_type);REQUIRE_API(patchlib_type_get_field);
@@ -428,7 +431,7 @@ static void init_mod(kernel_mod_handle_t *handle) {
         for(int j=0;j<hook_count;j++) if(hooks[j]!=PATCH_HOOK_INVALID_ID) patchlib_uninstall_hook(hooks[j]);
         hook_count=0;return;
     }
-    LOG_INFO("v1.1.3 初始化完成：世界阴影位于UI之前，保留原版明暗");
+    LOG_INFO("v1.1.4 初始化完成：世界阴影位于UI之前，保留原版明暗");
 }
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;

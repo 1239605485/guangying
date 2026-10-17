@@ -9,6 +9,7 @@ static uint32_t lookup_data[1024],*lookup_pointer=lookup_data;
 static uint16_t type_data[]={0},header_data[]={32},*type_pointer=type_data,*header_pointer=header_data;
 static patch_handle_t field(patch_handle_t type,const char *name) {
     (void)type;
+    if(!strcmp(name,"screenWidth") || !strcmp(name,"screenHeight") || !strcmp(name,"gameMenu")) return NULL;
     const char *names[]={"screenWidth","screenHeight","showSplash","gameMenu","mapFullscreen","dayTime","time","worldSurface","spriteBatch"};
     for(int i=0;i<9;i++)if(!strcmp(name,names[i]))return (void*)(uintptr_t)(i+1);
     return NULL;
@@ -19,11 +20,23 @@ static void *pointer(patch_handle_t field,void *instance) {
     uintptr_t i=(uintptr_t)field;return i && i<=12?slots[i-1]:NULL;
 }
 static patch_handle_t method(patch_handle_t type,const char *name,int count) {
-    (void)type;(void)count;return !strcmp(name,"get_screenPosition")?(void*)20:NULL;
+    (void)type;(void)count;
+    if(!strcmp(name,"get_screenPosition"))return (void*)20;
+    if(!strcmp(name,"get_screenWidth"))return (void*)21;
+    if(!strcmp(name,"get_screenHeight"))return (void*)22;
+    if(!strcmp(name,"get_gameMenu"))return (void*)23;
+    return NULL;
 }
 static bool valid(patch_handle_t handle) {return handle!=NULL;}
 static bool invoke(patch_handle_t method,patch_handle_t instance,void *result,void **args) {
-    (void)instance;(void)args;assert(method==(void*)20);float p[]={16,16};memcpy(result,p,sizeof(p));return true;
+    (void)instance;(void)args;
+    if(method==(void*)20) {float p[]={16,16};memcpy(result,p,sizeof(p));return true;}
+    /* Match libffi, including widening bool/int to sizeof(ffi_arg). */
+    intptr_t value;
+    if(method==(void*)21)value=sw;
+    else if(method==(void*)22)value=sh;
+    else {assert(method==(void*)23);value=menu;}
+    memcpy(result,&value,sizeof(value));return true;
 }
 static size_t length(patch_handle_t array) {(void)array;return 1;}
 static bool at(patch_handle_t array,size_t index,void *out) {
@@ -58,5 +71,7 @@ int main(void) {
     old_draws=draws;menu=true;
     before_interface(NULL,NULL,NULL,NULL);
     assert(draws==old_draws && begins==1 && ends==1);
+    sw=-7;assert(main_int("screenWidth",0)==-7);
+    assert(main_bool("gameMenu",false));
     return 0;
 }
