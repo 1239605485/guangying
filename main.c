@@ -234,8 +234,25 @@ static float alpha_soft(float r) {
 /* ============================ Main 取值 ============================ */
 /* PE 上 screenWidth/screenHeight/mouseX/mouseY/gameMenu 是**属性**；dayTime/time 等是字段 */
 
+typedef struct { char name[64]; patch_handle_t field,getter; } main_access;
+static main_access main_cache[24];
+static int main_cache_count;
+static main_access *main_access_for(const char *name) {
+    for(int i=0;i<main_cache_count;i++) if(!strcmp(main_cache[i].name,name)) return &main_cache[i];
+    if(main_cache_count>=24) return NULL;
+    main_access *a=&main_cache[main_cache_count++];
+    snprintf(a->name,sizeof(a->name),"%s",name);
+    a->field=patchlib_type_get_field(g_main_type,name);
+    char buf[80];snprintf(buf,sizeof(buf),"get_%s",name);
+    a->getter=patchlib_type_get_method_by_param_count(g_main_type,buf,0);
+    return a;
+}
+static patch_handle_t main_getter(const char *name) {
+    main_access *a=main_access_for(name);return a?a->getter:NULL;
+}
 static bool main_static_slot(const char *name, void **slot) {
-    patch_handle_t f = patchlib_type_get_field(g_main_type, name);
+    main_access *a=main_access_for(name);
+    patch_handle_t f = a?a->field:NULL;
     if (!f) return false;
     *slot = patchlib_field_get_pointer(f, NULL);
     return *slot != NULL;
@@ -244,8 +261,7 @@ static bool main_static_slot(const char *name, void **slot) {
 static int main_int(const char *name, int fallback) {
     void *slot = NULL;
     if (main_static_slot(name, &slot)) return *(int *)slot;
-    char buf[64]; snprintf(buf, sizeof(buf), "get_%s", name);
-    patch_handle_t g = patchlib_type_get_method_by_param_count(g_main_type, buf, 0);
+    patch_handle_t g = main_getter(name);
     if (g && patchlib_is_valid(g)) {
         int out = fallback;
         if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return out;
@@ -256,8 +272,7 @@ static int main_int(const char *name, int fallback) {
 static double main_double(const char *name, double fallback) {
     void *slot = NULL;
     if (main_static_slot(name, &slot)) return *(double *)slot;
-    char buf[64]; snprintf(buf, sizeof(buf), "get_%s", name);
-    patch_handle_t g = patchlib_type_get_method_by_param_count(g_main_type, buf, 0);
+    patch_handle_t g = main_getter(name);
     if (g && patchlib_is_valid(g)) {
         double out = fallback;
         if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return out;
@@ -267,8 +282,7 @@ static double main_double(const char *name, double fallback) {
 
 /* 取静态属性返回的 Vector2（8 字节结构，内核把返回值写进缓冲） */
 static bool main_vec2(const char *name, float *x, float *y) {
-    char buf[64]; snprintf(buf, sizeof(buf), "get_%s", name);
-    patch_handle_t g = patchlib_type_get_method_by_param_count(g_main_type, buf, 0);
+    patch_handle_t g = main_getter(name);
     if (!g || !patchlib_is_valid(g)) return false;
     float v[2] = { 0, 0 };
     if (!patchlib_method_invoke_args(g, NULL, v, NULL)) return false;
@@ -279,8 +293,7 @@ static bool main_vec2(const char *name, float *x, float *y) {
 static bool main_bool(const char *name, bool fallback) {
     void *slot = NULL;
     if (main_static_slot(name, &slot)) return *(unsigned char *)slot != 0;
-    char buf[64]; snprintf(buf, sizeof(buf), "get_%s", name);
-    patch_handle_t g = patchlib_type_get_method_by_param_count(g_main_type, buf, 0);
+    patch_handle_t g = main_getter(name);
     if (g && patchlib_is_valid(g)) {
         int out = fallback ? 1 : 0;
         if (patchlib_method_invoke_args(g, NULL, &out, NULL)) return out != 0;
@@ -341,7 +354,7 @@ static float grid_slope;
 static float previous_cam_x,previous_cam_y;
 static bool had_camera;
 static void render_world(int sw,int sh,float cx,float cy,const float m[16],bool day,float t) {
-    float lift=sinf(3.14159265f*clamp01(t));
+    float lift=smooth01(sinf(3.14159265f*clamp01(t)));
     float slope=0.30f+2.8f*lift;
     int dir=t<0.5f?1:-1;
     float zx=m[0],zy=m[5];
