@@ -2,9 +2,9 @@
   "pkgId": "lzup.lightsandshadows",
   "name": "光影 Lights And Shadows",
   "author": "lzup333/liuxin",
-  "description": "给手机版泰拉瑞亚加光照氛围：日光/月光的色温（整屏乘法色罩）与柔光（真·加色提亮），随昼夜与月相变化；主菜单与地下自动不生效。手机端没有 RenderTarget/HLSL，本模组基于原生 GL 屏幕后处理（eglSwapBuffers 钩子）独立实现。灵感来源：tModLoader 的 Lights And Shadows（作者 yiyang233），特此致谢。",
-  "version": "2.1.0",
-  "versionCode": 5,
+  "description": "感谢yiyang233大佬提供思路",
+  "version": "2.5.0-light",
+  "versionCode": 11,
   "detailedInformationURL": "",
   "updateURL": "",
   "dependence": [],
@@ -25,5 +25,77 @@
       "x64": false,
       "x86": false
     }
-  }
+  },
+  "settings": [
+    {
+      "key": "enabled",
+      "title": "启用光影",
+      "description": "关闭后完全不介入渲染",
+      "type": "SWITCH",
+      "defaultValue": true,
+      "section": "常规"
+    },
+    {
+      "key": "quality",
+      "title": "画质档位",
+      "description": "性能最省、视觉最细；选「自定义」时使用下面四项",
+      "type": "CHOICE",
+      "defaultValue": "balanced",
+      "options": [
+        { "value": "perf", "label": "性能" },
+        { "value": "balanced", "label": "平衡" },
+        { "value": "visual", "label": "视觉" },
+        { "value": "custom", "label": "自定义" }
+      ],
+      "section": "常规"
+    },
+    {
+      "key": "ray_samples",
+      "title": "光柱采样",
+      "description": "仅自定义档生效；越大光柱越细腻、越吃性能",
+      "type": "INTEGER",
+      "defaultValue": 16,
+      "min": 4,
+      "max": 30,
+      "step": 2,
+      "unit": "次",
+      "section": "自定义"
+    },
+    {
+      "key": "shadow_div",
+      "title": "阴影分辨率",
+      "description": "仅自定义档生效；数值是画面缩小的倍数，2 最清晰、6 最省",
+      "type": "INTEGER",
+      "defaultValue": 3,
+      "min": 2,
+      "max": 6,
+      "step": 1,
+      "unit": "×",
+      "section": "自定义"
+    },
+    {
+      "key": "glow",
+      "title": "光晕强度",
+      "description": "仅自定义档生效；100 为默认亮度",
+      "type": "INTEGER",
+      "defaultValue": 60,
+      "min": 1,
+      "max": 150,
+      "step": 5,
+      "unit": "%",
+      "section": "自定义"
+    },
+    {
+      "key": "rays",
+      "title": "光柱强度",
+      "description": "仅自定义档生效；100 为默认强度",
+      "type": "INTEGER",
+      "defaultValue": 55,
+      "min": 1,
+      "max": 150,
+      "step": 5,
+      "unit": "%",
+      "section": "自定义"
+    }
+  ]
 }
