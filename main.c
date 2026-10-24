@@ -2,15 +2,20 @@
 // 光影 Lights And Shadows —— KernelLoader (tefkernel) 模组，手机端 / PE
 //
 // 灵感来源：tModLoader 的「Lights And Shadows」(作者 yiyang233)。实现与参数自研。
+// 感谢 yiyang233 大佬提供思路：先画光（中心取太阳位置）→ 蓝通道提阴影 → 沿太阳方向
+// 缩放叠加 → 光减阴影 → additive 叠回。
 //
 // ---------------------------------------------------------------------------
-// v2.3：**只做光**（阴影部分已移除，交给游戏自带的光照）
+// v2.4：仿原版的「光 − 阴影」屏幕后处理（感谢 yiyang233 大佬的思路）
 // ---------------------------------------------------------------------------
 //   绘制走原生 GL 屏幕后处理（eglSwapBuffers 钩子，在交换之前画）：
-//     · 屏幕空间体积光：把本帧拷成纹理，朝太阳径向累加采样，亮部拖出丁达尔光柱
-//     · 太阳光晕：亮核 + 暖光晕（加色）
-//     · 调色：天空垂直渐变 + 暗角（乘法）
-//   单趟后处理写回，不破坏 alpha。
+//     · 光：以太阳位置为中心的宽光晕（加色），颜色随一天时刻变化
+//     · 阴影：本帧缩到 1/3，按蓝色通道提取遮挡（树/地面蓝少 → 阴影强）
+//     · 光柱：阴影沿太阳方向逐层放大叠加成条纹，「光 − 阴影」漏出丁达尔光柱
+//   光按 additive 叠回场景，不破坏 alpha。
+//
+//   太阳位置直接取游戏自己算好的 Main.LastCelestialBodyPosition，和天上那颗太阳对齐；
+//   读不到才退回自己的圆弧（且不画亮核，避免出现第二颗太阳）。
 //
 //   状态由 Main.DrawInterface_36_Cursor 的 postfix 读出来写进快照（游戏线程），
 //   渲染线程只读快照 —— 避免跨线程读游戏数据。
@@ -43,16 +48,16 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.3.0-light"
+#define MOD_VERSION "2.4.0-light"
 
 /* ============================================================================
  * 可调参数：<私有目录>/ls_settings.txt（每 2 秒热读）
- *   glow=0.20   太阳光晕强度（0 = 关掉光晕）
- *   rays=0.55   体光/丁达尔光线强度（0 = 关掉）
+ *   glow=0.60   太阳光（宽光晕）强度（0 = 关掉）
+ *   rays=0.55   阴影条纹/光柱强度（0 = 关掉，只剩光晕）
  *   sun=-1      测试用：强制太阳时刻 0..1（<0 = 用游戏时间）
  * ========================================================================== */
 
-static float g_cfg_glow = 0.20f;
+static float g_cfg_glow = 0.60f;
 static float g_cfg_rays = 0.55f;
 static float g_cfg_sun = -1.0f;
 static char  g_private_dir[1024];
@@ -129,6 +134,23 @@ static double main_double(const char *name, double fallback) {
     return fallback;
 }
 
+/* Vector2：优先读静态字段，否则原生直调 0 参 getter
+ * （两个 float 的 HFA 结构体走 s0/s1 返回，和原生调用约定一致） */
+static bool main_vec2(const char *name, float *x, float *y) {
+    void *slot = NULL;
+    if (main_static_slot(name, &slot)) {
+        *x = ((float *)slot)[0];
+        *y = ((float *)slot)[1];
+        return true;
+    }
+    void *p = main_getter_ptr(name);
+    if (!p) return false;
+    v2_t v = ((v2_t (*)(void))p)();
+    *x = v.x;
+    *y = v.y;
+    return true;
+}
+
 static bool player_center(float *cx, float *cy) {
     patch_handle_t player_type = patchlib_type_get_type("Terraria", "Player");
     if (!player_type) return false;
@@ -166,6 +188,9 @@ typedef struct {
     int   enabled;
     int   virtW, virtH;
     float sunU, sunV;            /* 太阳在 GL UV 里的位置（y 向上） */
+    int   sunExact;              /* 1 = 取自游戏真实位置 */
+    float shadowM;               /* 阴影提取阈值：蓝通道低于它算阴影 */
+    float shadowK;               /* 阴影强度（夜里关掉，0 = 不画条纹） */
     float warmR, warmG, warmB;   /* 光晕颜色 */
     float glowA;                 /* 光晕强度 */
     float topR, topG, topB;      /* 天空顶部色（乘法） */
@@ -196,14 +221,36 @@ static void compute_light(light_snap_t *s) {
     if (t01 > 1.0f) t01 = 1.0f;
     if (g_cfg_sun >= 0.0f) t01 = g_cfg_sun;   /* 测试用：强制太阳时刻 */
 
-    /* 光源走一条标准圆弧：t01=0 左侧地平线升起，0.5 最高，1 右侧落下 */
-    float ang = 3.14159265f * t01;
-    float arcW = sw * 0.5f + 160.0f;
-    float baseY = sh * 0.62f;
-    float sunVX = sw * 0.5f - cosf(ang) * arcW;
-    float sunVY = baseY - sinf(ang) * (sh * 0.42f);
-    s->sunU = sunVX / (float)sw;
-    s->sunV = 1.0f - sunVY / (float)sh;
+    float ang = 3.14159265f * t01;   /* 光强/月相都按这个时刻算 */
+
+    /* 太阳位置：直接用游戏自己算好的归一化位置，和天空里那颗太阳严丝合缝。
+     * 拿不到再用圆弧兜底；兜底时不画实心亮核，免得天上出现第二颗太阳。 */
+    float sx = 0.0f, sy = 0.0f;
+    int exact = main_vec2("LastCelestialBodyPosition", &sx, &sy) &&
+                !(sx == 0.0f && sy == 0.0f);
+    if (exact) {
+        /* 有的版本给的是像素坐标，按屏幕尺寸归一化 */
+        if (sx < -1.5f || sx > 1.5f || sy < -1.5f || sy > 1.5f) {
+            sx /= (float)sw;
+            sy /= (float)sh;
+        }
+        if (!isfinite(sx) || !isfinite(sy) ||
+            sx < -1.0f || sx > 2.0f || sy < -1.0f || sy > 2.0f) exact = 0;
+    }
+    if (exact) {
+        s->sunU = sx;
+        s->sunV = 1.0f - sy;
+    } else {
+        float arcW = sw * 0.5f + 160.0f;
+        float baseY = sh * 0.62f;
+        s->sunU = (sw * 0.5f - cosf(ang) * arcW) / (float)sw;
+        s->sunV = 1.0f - (baseY - sinf(ang) * (sh * 0.42f)) / (float)sh;
+    }
+    s->sunExact = exact;
+    /* 阴影：白天按蓝色通道（天空很蓝，b≈0.75；树/地面 b≈0.2）取阈值；
+     * 夜里整屏都暗，蓝通道区分不出天空，直接把条纹关掉 */
+    s->shadowM = day ? 0.50f : 0.02f;
+    s->shadowK = day ? 1.0f : 0.0f;
 
     /* 亮度曲线：sin^0.8 —— 正午平台宽、日出日落更快暗下去 */
     float noon = sinf(ang);
@@ -215,11 +262,19 @@ static void compute_light(light_snap_t *s) {
     float intensity = day ? (0.35f + DAY_GAIN * lift)
                           : (0.30f + NIGHT_GAIN * lift) * moonK;
 
-    /* 光晕颜色：自己的色板 —— 黎明/黄昏暖橙、正午近白；夜里冷蓝、满月偏白 */
+    /* 光色：按一天里的时刻插值（黎明淡紫 → 正午暖黄 → 黄昏橙红），夜里冷蓝 */
     if (day) {
-        s->warmR = 1.00f;
-        s->warmG = 0.66f + 0.26f * lift;
-        s->warmB = 0.44f + 0.38f * lift;
+        if (t01 < 0.5f) {
+            float u = t01 * 2.0f;
+            s->warmR = 0.73f + 0.13f * u;
+            s->warmG = 0.54f + 0.22f * u;
+            s->warmB = 0.58f - 0.06f * u;
+        } else {
+            float u = (t01 - 0.5f) * 2.0f;
+            s->warmR = 0.86f - 0.14f * u;
+            s->warmG = 0.76f - 0.46f * u;
+            s->warmB = 0.52f - 0.14f * u;
+        }
     } else {
         float w = (1.0f - moonK) * 0.5f;
         s->warmR = 0.42f + 0.24f * w;
@@ -227,7 +282,7 @@ static void compute_light(light_snap_t *s) {
         s->warmB = 0.92f;
     }
     s->glowA = intensity * g_cfg_glow;
-    if (s->glowA > 0.55f) s->glowA = 0.55f;
+    if (s->glowA > 1.2f) s->glowA = 1.2f;
 
     /* 整屏乘法色罩：天空垂直渐变 + 暗角。
      * 白天顶部略偏冷、地平线随日落渐暖；夜里顶部深蓝、地平线稍亮。 */
@@ -253,34 +308,42 @@ static void compute_light(light_snap_t *s) {
 }
 
 /* ============================================================================
- * 四、GL 层：单趟屏幕后处理（读回本帧 -> 体积光/光晕/调色 -> 写回）
+ * 四、GL 层：仿原版「光 − 阴影」的屏幕后处理
  *
- *   MSAA 设备读不了默认帧缓冲，用 glBlitFramebuffer 把它解析到非多重采样的
- *   FBO 纹理里再采样；解析/拷贝都失败时回退到「纯叠加」（光晕加色 + 色罩乘法），
- *   保证屏幕不会黑。三个模式按 g_mode 记忆：
- *     1 = 后处理（体积光）  2 = 纯叠加
+ *   1) 把本帧读成场景纹理（MSAA 用 glBlitFramebuffer 解析；不行再 glCopyTexSubImage2D）
+ *   2) 场景缩到 1/3 分辨率，按蓝色通道取阴影：蓝越小阴影越强（天空是蓝的 → 不算阴影）
+ *   3) 阴影沿太阳方向逐层放大叠加成条纹；以太阳为中心的宽光晕减掉条纹，
+ *      再 additive 叠回场景 —— 树缝里就漏出光柱
+ *
+ *   读不了场景的设备回退纯叠加（光晕加色 + 色罩乘法），屏幕永远不会黑。
+ *   g_mode: 0=未探测  1=后处理  2=纯叠加
  * ========================================================================== */
 
 static const float QUAD[8] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f };
 
 static int g_gl_state;
-static int g_mode;              /* 1=后处理 2=纯叠加 */
-static GLuint g_vbo, g_prog_post, g_prog_tint, g_prog_glow, g_scene_tex, g_fbo;
-static int g_tex_w, g_tex_h;
+static int g_mode;
+static int g_use_blit;
+static GLuint g_vbo;
+static GLuint g_prog_post, g_prog_tint, g_prog_glow, g_prog_shadow;
+static GLuint g_scene_tex, g_shadow_tex;
+static GLuint g_fbo_scene, g_fbo_shadow;
+static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h;
 
-static GLint a_post, u_post_center, u_post_size, u_post_res, u_post_sun,
-             u_post_scene, u_post_glow_color, u_post_glow, u_post_rays,
-             u_post_top, u_post_bottom, u_post_vignette;
+static GLint a_post, u_post_scene, u_post_shadow, u_post_res, u_post_sun,
+             u_post_color, u_post_beam, u_post_rays, u_post_shadow_k, u_post_zoom;
 static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
 static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
+static GLint a_shadow, u_shadow_scene, u_shadow_res, u_shadow_m;
 
 #define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
-#define GL_FRAMEBUFFER       0x8D40
-#define GL_COLOR_ATTACHMENT0 0x8CE0
-#define GL_READ_FRAMEBUFFER  0x8CA8
-#define GL_DRAW_FRAMEBUFFER  0x8CA9
-#define GL_COLOR_BUFFER_BIT  0x00004000
+#define GL_FRAMEBUFFER_BINDING 0x8CA6
+#define GL_FRAMEBUFFER         0x8D40
+#define GL_COLOR_ATTACHMENT0   0x8CE0
+#define GL_READ_FRAMEBUFFER    0x8CA8
+#define GL_DRAW_FRAMEBUFFER    0x8CA9
+#define GL_COLOR_BUFFER_BIT    0x00004000
 
 typedef void (*PFN_bindvao)(GLuint);
 typedef void (*PFN_genfb)(GLsizei, GLuint *);
@@ -289,10 +352,10 @@ typedef void (*PFN_fbtex)(GLenum, GLenum, GLenum, GLuint, GLint);
 typedef void (*PFN_blit)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
 
 static PFN_bindvao p_bind_vao;
-static PFN_genfb p_gen_fb;
-static PFN_bindfb p_bind_fb;
-static PFN_fbtex p_fb_tex;
-static PFN_blit p_blit;
+static PFN_genfb   p_gen_fb;
+static PFN_bindfb  p_bind_fb;
+static PFN_fbtex   p_fb_tex;
+static PFN_blit    p_blit;
 
 static void *proc(const char *a, const char *b) {
     void *p = (void *)eglGetProcAddress(a);
@@ -310,7 +373,7 @@ static const char *VS_SRC =
     "  gl_Position = vec4(uCenter + aPos * uSize, 0.0, 1.0);\n"
     "}\n";
 
-/* 纯叠加用的两段（回退路径，不读帧缓冲） */
+/* —— 回退路径用：整屏色罩（乘法） —— */
 static const char *FS_TINT =
     "precision mediump float;\n"
     "uniform vec2 uRes;\n"
@@ -326,6 +389,7 @@ static const char *FS_TINT =
     "  gl_FragColor = vec4(c, 1.0);\n"
     "}\n";
 
+/* —— 回退路径用：太阳光晕（加色，不读帧缓冲） —— */
 static const char *FS_GLOW =
     "precision mediump float;\n"
     "uniform vec2 uRes;\n"
@@ -337,51 +401,51 @@ static const char *FS_GLOW =
     "  vec2 d = uv - uSun;\n"
     "  d.x *= uRes.x / uRes.y;\n"
     "  float r = length(d);\n"
-    "  float core = smoothstep(0.07, 0.0, r);\n"
-    "  float halo = exp(-r * r * 5.0);\n"
-    "  vec3 col = uColor * (core * 1.1 + halo) * uStrength;\n"
-    "  col += vec3(core * 0.8 * uStrength);\n"
-    "  gl_FragColor = vec4(col, 1.0);\n"
+    "  float fall = max(0.0, (3.0 - r) / 3.0);\n"
+    "  gl_FragColor = vec4(uColor * fall * fall * uStrength, 1.0);\n"
     "}\n";
 
-/* 体积光后处理（需要场景纹理） */
-#define RAY_SAMPLES 14
-static const char *FS_POST =
+/* —— 阴影提取（1/3 分辨率）：蓝通道低于阈值 m 的像素算阴影 —— */
+static const char *FS_SHADOW =
     "precision mediump float;\n"
     "uniform sampler2D uScene;\n"
     "uniform vec2 uRes;\n"
+    "uniform float uM;\n"
+    "void main(){\n"
+    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
+    "  float b = texture2D(uScene, uv).b;\n"
+    "  float s = (b < uM) ? pow(1.0 - b, 0.75) : 0.0;\n"
+    "  gl_FragColor = vec4(s, s, s, 1.0);\n"
+    "}\n";
+
+/* —— 最终合成：光晕 − 沿太阳方向的阴影条纹，additive 叠回场景 —— */
+static const char *FS_POST =
+    "precision mediump float;\n"
+    "uniform sampler2D uScene;\n"
+    "uniform sampler2D uShadow;\n"
+    "uniform vec2 uRes;\n"
     "uniform vec2 uSun;\n"
-    "uniform vec3 uGlowColor;\n"
-    "uniform float uGlow;\n"
+    "uniform vec3 uColor;\n"
+    "uniform float uBeam;\n"
     "uniform float uRays;\n"
-    "uniform vec3 uTop;\n"
-    "uniform vec3 uBottom;\n"
-    "uniform float uVignette;\n"
+    "uniform float uShadowK;\n"
+    "uniform float uZoom;\n"
     "void main(){\n"
     "  vec2 uv = gl_FragCoord.xy / uRes;\n"
     "  vec3 scene = texture2D(uScene, uv).rgb;\n"
-    "  vec2 d = uv - uSun;\n"
-    "  d.x *= uRes.x / uRes.y;\n"
+    "  vec2 d = (uv - uSun) * vec2(uRes.x / uRes.y, 1.0);\n"
     "  float r = length(d);\n"
-    "  float core = smoothstep(0.07, 0.0, r);\n"
-    "  float halo = exp(-r * r * 5.0);\n"
-    "  vec3 glow = (uGlowColor * (core * 1.1 + halo) + vec3(core * 0.8)) * uGlow;\n"
-    "  vec2 step = (uv - uSun) / 14.0;\n"
-    "  vec2 p = uv;\n"
-    "  vec3 acc = vec3(0.0);\n"
-    "  float w = 1.0;\n"
-    "  for (int i = 0; i < 14; ++i) {\n"
-    "    p -= step;\n"
-    "    acc += texture2D(uScene, clamp(p, 0.0, 1.0)).rgb * w;\n"
-    "    w *= 0.92;\n"
+    "  float fall = max(0.0, (3.0 - r) / 3.0);\n"
+    "  float streak = 0.0;\n"
+    "  for (int i = 0; i < 30; ++i) {\n"
+    "    float k = 1.0 + float(i) * uZoom;\n"
+    "    vec2 p = uSun + (uv - uSun) / k;\n"
+    "    streak += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
     "  }\n"
-    "  vec3 rays = acc * (uRays / 14.0);\n"
-    "  vec3 col = scene + glow + rays;\n"
-    "  vec3 grade = mix(uBottom, uTop, clamp(uv.y, 0.0, 1.0));\n"
-    "  vec2 q = uv - 0.5;\n"
-    "  grade *= clamp(1.0 - uVignette * dot(q, q) * 3.0, 0.0, 1.0);\n"
-    "  col *= grade;\n"
-    "  gl_FragColor = vec4(col, 1.0);\n"
+    "  streak *= 0.055 * uShadowK * uRays;\n"
+    "  vec3 light = uColor * fall * uBeam;\n"
+    "  light = max(light - vec3(streak), 0.0);\n"
+    "  gl_FragColor = vec4(scene + light, 1.0);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src, const char *tag) {
@@ -431,23 +495,31 @@ static GLuint build_program(const char *fsrc, const char *tag) {
 static bool gl_build(void) {
     if (g_gl_state != 0) return g_gl_state > 0;
 
-    g_prog_post = build_program(FS_POST, "体积光");
-    g_prog_tint = build_program(FS_TINT, "色罩");
-    g_prog_glow = build_program(FS_GLOW, "光晕");
-    if (!g_prog_post || !g_prog_tint || !g_prog_glow) { LOG_ERROR("GL 程序构建失败"); g_gl_state = -1; return false; }
+    g_prog_post   = build_program(FS_POST,   "光-阴影");
+    g_prog_shadow = build_program(FS_SHADOW, "阴影");
+    g_prog_tint   = build_program(FS_TINT,   "色罩");
+    g_prog_glow   = build_program(FS_GLOW,   "光晕");
+    if (!g_prog_post || !g_prog_shadow || !g_prog_tint || !g_prog_glow) {
+        LOG_ERROR("GL 程序构建失败");
+        g_gl_state = -1;
+        return false;
+    }
 
     a_post = glGetAttribLocation(g_prog_post, "aPos");
-    u_post_center = glGetUniformLocation(g_prog_post, "uCenter");
-    u_post_size = glGetUniformLocation(g_prog_post, "uSize");
-    u_post_res = glGetUniformLocation(g_prog_post, "uRes");
-    u_post_sun = glGetUniformLocation(g_prog_post, "uSun");
-    u_post_scene = glGetUniformLocation(g_prog_post, "uScene");
-    u_post_glow_color = glGetUniformLocation(g_prog_post, "uGlowColor");
-    u_post_glow = glGetUniformLocation(g_prog_post, "uGlow");
-    u_post_rays = glGetUniformLocation(g_prog_post, "uRays");
-    u_post_top = glGetUniformLocation(g_prog_post, "uTop");
-    u_post_bottom = glGetUniformLocation(g_prog_post, "uBottom");
-    u_post_vignette = glGetUniformLocation(g_prog_post, "uVignette");
+    u_post_scene    = glGetUniformLocation(g_prog_post, "uScene");
+    u_post_shadow   = glGetUniformLocation(g_prog_post, "uShadow");
+    u_post_res      = glGetUniformLocation(g_prog_post, "uRes");
+    u_post_sun      = glGetUniformLocation(g_prog_post, "uSun");
+    u_post_color    = glGetUniformLocation(g_prog_post, "uColor");
+    u_post_beam     = glGetUniformLocation(g_prog_post, "uBeam");
+    u_post_rays     = glGetUniformLocation(g_prog_post, "uRays");
+    u_post_shadow_k = glGetUniformLocation(g_prog_post, "uShadowK");
+    u_post_zoom     = glGetUniformLocation(g_prog_post, "uZoom");
+
+    a_shadow      = glGetAttribLocation(g_prog_shadow, "aPos");
+    u_shadow_scene = glGetUniformLocation(g_prog_shadow, "uScene");
+    u_shadow_res   = glGetUniformLocation(g_prog_shadow, "uRes");
+    u_shadow_m     = glGetUniformLocation(g_prog_shadow, "uM");
 
     a_tint = glGetAttribLocation(g_prog_tint, "aPos");
     u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
@@ -465,19 +537,28 @@ static bool gl_build(void) {
     u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
     u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
 
-    if (a_post < 0 || a_tint < 0 || a_glow < 0) { LOG_ERROR("aPos 无效"); g_gl_state = -1; return false; }
+    if (a_post < 0 || a_shadow < 0 || a_tint < 0 || a_glow < 0) {
+        LOG_ERROR("aPos 无效");
+        g_gl_state = -1;
+        return false;
+    }
 
     glGenBuffers(1, &g_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    glGenTextures(1, &g_scene_tex);
-    glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    GLuint tex[2] = { 0, 0 };
+    glGenTextures(2, tex);
+    g_scene_tex = tex[0];
+    g_shadow_tex = tex[1];
+    for (int i = 0; i < 2; ++i) {
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     glBindTexture(GL_TEXTURE_2D, 0);
 
     p_bind_vao = (PFN_bindvao)proc("glBindVertexArrayOES", "glBindVertexArray");
@@ -486,54 +567,73 @@ static bool gl_build(void) {
     p_fb_tex   = (PFN_fbtex)  proc("glFramebufferTexture2D", "glFramebufferTexture2DOES");
     p_blit     = (PFN_blit)   eglGetProcAddress("glBlitFramebuffer");
 
-    g_fbo = 0;
+    g_fbo_scene = 0;
+    g_fbo_shadow = 0;
     if (p_gen_fb && p_bind_fb && p_fb_tex) {
-        p_gen_fb(1, &g_fbo);
-        p_bind_fb(GL_FRAMEBUFFER, g_fbo);
-        p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene_tex, 0);
-        p_bind_fb(GL_FRAMEBUFFER, 0);
+        GLuint fb[2] = { 0, 0 };
+        p_gen_fb(2, fb);
+        g_fbo_scene = fb[0];
+        g_fbo_shadow = fb[1];
     }
 
     g_gl_state = 1;
-    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u）", MOD_VERSION, p_blit ? 1 : 0, g_fbo);
+    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u/%u）", MOD_VERSION,
+             p_blit ? 1 : 0, g_fbo_scene, g_fbo_shadow);
     return true;
 }
 
-/* 决定用哪种模式：能读回场景就用体积光，否则纯叠加 */
-static int gl_probe_mode(int W, int H) {
+/* 把默认帧缓冲读进场景纹理；1=成功 */
+static int fill_scene(int W, int H) {
     glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-    if (g_tex_w != W || g_tex_h != H) {
+    if (g_scene_w != W || g_scene_h != H) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        g_tex_w = W; g_tex_h = H;
+        g_scene_w = W;
+        g_scene_h = H;
+        if (p_bind_fb && g_fbo_scene) {
+            p_bind_fb(GL_FRAMEBUFFER, g_fbo_scene);
+            p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene_tex, 0);
+            p_bind_fb(GL_FRAMEBUFFER, 0);
+        }
     }
 
-    glGetError(); /* 清空旧错误 */
-    if (p_blit && g_fbo) {
+    glGetError();
+    if (g_use_blit && p_blit && g_fbo_scene) {
         p_bind_fb(GL_READ_FRAMEBUFFER, 0);
-        p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo);
+        p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo_scene);
         p_blit(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         p_bind_fb(GL_FRAMEBUFFER, 0);
-        if (glGetError() == GL_NO_ERROR) {
-            LOG_INFO("MSAA 解析成功，启用体积光");
-            return 1;
-        }
+        if (glGetError() == GL_NO_ERROR) return 1;
         glGetError();
+        g_use_blit = 0;
     }
 
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
-    if (glGetError() == GL_NO_ERROR) {
-        LOG_INFO("拷贝场景成功，启用体积光");
+    if (glGetError() == GL_NO_ERROR) return 1;
+    return 0;
+}
+
+/* 探测：MSAA 解析 → 直接拷贝 → 纯叠加 */
+static int gl_probe_mode(int W, int H) {
+    if (p_blit && g_fbo_scene) {
+        g_use_blit = 1;
+        if (fill_scene(W, H)) {
+            LOG_INFO("MSAA 解析成功，启用体积光");
+            return 1;
+        }
+        LOG_INFO("MSAA 解析失败，改试直接拷贝");
+    }
+    g_use_blit = 0;
+    if (fill_scene(W, H)) {
+        LOG_INFO("场景拷贝成功，启用体积光");
         return 1;
     }
-
     LOG_ERROR("读场景失败，回退到纯叠加");
     return 2;
 }
 
-static void gl_setup_quad(GLuint prog, GLint apos, GLint ucen, GLint usz,
-                          float cx, float cy, float hw, float hh) {
+static void bind_quad(GLuint prog, GLint apos, GLint ucen, GLint usz, float hw, float hh) {
     glUseProgram(prog);
-    if (ucen >= 0) glUniform2f(ucen, cx, cy);
+    if (ucen >= 0) glUniform2f(ucen, 0.f, 0.f);
     if (usz >= 0) glUniform2f(usz, hw, hh);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glEnableVertexAttribArray((GLuint)apos);
@@ -552,7 +652,7 @@ static void gl_render(const light_snap_t *s) {
     static int first = 1;
     if (first) { first = 0; LOG_INFO("首次交换绘制：视口=%dx%d", W, H); }
 
-    GLint pProg = 0, pTex = 0, pAct = 0, pVao = 0, pBuf = 0;
+    GLint pProg = 0, pTex = 0, pAct = 0, pVao = 0, pBuf = 0, pFbo = 0;
     GLint pBlend = 0, pDepth = 0, pCull = 0, pScissor = 0;
     GLint pSrcRGB = 0, pDstRGB = 0, pEqRGB = 0, pSrcA = 0, pDstA = 0, pEqA = 0;
     GLint pVp[4] = { 0, 0, 0, 0 };
@@ -561,6 +661,7 @@ static void gl_render(const light_snap_t *s) {
     glGetIntegerv(GL_ACTIVE_TEXTURE, &pAct);
     if (p_bind_vao) glGetIntegerv(GL_VERTEX_ARRAY_BINDING_OES, &pVao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &pBuf);
+    if (p_bind_fb) glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pFbo);
     glGetIntegerv(GL_BLEND, &pBlend);
     glGetIntegerv(GL_DEPTH_TEST, &pDepth);
     glGetIntegerv(GL_CULL_FACE, &pCull);
@@ -582,46 +683,60 @@ static void gl_render(const light_snap_t *s) {
 
     if (g_mode == 0) g_mode = gl_probe_mode(W, H);
 
-    if (g_mode == 1) {
-        /* —— 体积光：覆盖写回 —— */
-        glDisable(GL_BLEND);
-        glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-        if (g_tex_w != W || g_tex_h != H) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-            g_tex_w = W; g_tex_h = H;
-        }
-        if (p_blit && g_fbo) {
-            p_bind_fb(GL_READ_FRAMEBUFFER, 0);
-            p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo);
-            p_blit(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (g_mode == 1 && fill_scene(W, H)) {
+        /* —— 阴影：场景缩到 1/3，按蓝色通道取阴影 —— */
+        int sw = W / 3, sh = H / 3;
+        if (sw < 1) sw = 1;
+        if (sh < 1) sh = 1;
+        if (g_fbo_shadow && p_bind_fb) {
+            glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
+            if (g_shadow_w != sw || g_shadow_h != sh) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                g_shadow_w = sw;
+                g_shadow_h = sh;
+                p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
+                p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_shadow_tex, 0);
+            }
+            p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
+            glViewport(0, 0, sw, sh);
+            glDisable(GL_BLEND);
+            bind_quad(g_prog_shadow, a_shadow, -1, -1, 1.f, 1.f);
+            glUniform2f(u_shadow_res, (float)sw, (float)sh);
+            glUniform1f(u_shadow_m, s->shadowM);
+            glUniform1i(u_shadow_scene, 0);
+            glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             p_bind_fb(GL_FRAMEBUFFER, 0);
-        } else {
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
+            glViewport(0, 0, W, H);
         }
 
-        glUseProgram(g_prog_post);
-        glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-        glEnableVertexAttribArray((GLuint)a_post);
-        glVertexAttribPointer((GLuint)a_post, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glUniform2f(u_post_center, 0.f, 0.f);
-        glUniform2f(u_post_size, 1.f, 1.f);
+        /* —— 合成：光晕 − 条纹，additive 叠回 —— */
+        glDisable(GL_BLEND);
+        bind_quad(g_prog_post, a_post, -1, -1, 1.f, 1.f);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+        glUniform1i(u_post_scene, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
+        glUniform1i(u_post_shadow, 1);
         glUniform2f(u_post_res, (float)W, (float)H);
         glUniform2f(u_post_sun, s->sunU, s->sunV);
-        glUniform1i(u_post_scene, 0);
-        glUniform3f(u_post_glow_color, s->warmR, s->warmG, s->warmB);
-        glUniform1f(u_post_glow, s->glowA);
+        glUniform3f(u_post_color, s->warmR, s->warmG, s->warmB);
+        glUniform1f(u_post_beam, s->glowA);
         glUniform1f(u_post_rays, g_cfg_rays);
-        glUniform3f(u_post_top, s->topR, s->topG, s->topB);
-        glUniform3f(u_post_bottom, s->botR, s->botG, s->botB);
-        glUniform1f(u_post_vignette, s->vignette);
+        glUniform1f(u_post_shadow_k, s->shadowK);
+        glUniform1f(u_post_zoom, 0.111f);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
     } else {
         /* —— 纯叠加：光晕加色 + 色罩乘法（不读帧缓冲） —— */
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
 
         glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
-        gl_setup_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 0.f, 0.f, 1.f, 1.f);
+        bind_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 1.f, 1.f);
         glUniform2f(u_tint_res, (float)W, (float)H);
         glUniform3f(u_tint_top, s->topR, s->topG, s->topB);
         glUniform3f(u_tint_bottom, s->botR, s->botG, s->botB);
@@ -631,7 +746,7 @@ static void gl_render(const light_snap_t *s) {
         if (s->glowA > 0.004f && s->sunU > -0.35f && s->sunU < 1.35f &&
             s->sunV > -0.35f && s->sunV < 1.35f) {
             glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
-            gl_setup_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 0.f, 0.f, 1.f, 1.f);
+            bind_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 1.f, 1.f);
             glUniform2f(u_glow_res, (float)W, (float)H);
             glUniform2f(u_glow_sun, s->sunU, s->sunV);
             glUniform3f(u_glow_color, s->warmR, s->warmG, s->warmB);
@@ -640,6 +755,7 @@ static void gl_render(const light_snap_t *s) {
         }
     }
 
+    if (p_bind_fb) p_bind_fb(GL_FRAMEBUFFER, (GLuint)pFbo);
     if (p_bind_vao && pVao) p_bind_vao((GLuint)pVao);
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)pBuf);
     glUseProgram((GLuint)pProg);
@@ -764,9 +880,10 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
     snap_commit();
 
     if ((g_frames % 600) == 1) {
-        LOG_INFO("太阳uvx1000=(%d,%d) 光晕x100=%d 地色x100=%d 暗角x100=%d",
-                 (int)(s->sunU * 1000), (int)(s->sunV * 1000),
-                 (int)(s->glowA * 100), (int)(s->botR * 100), (int)(s->vignette * 100));
+        LOG_INFO("太阳uvx1000=(%d,%d) 真实=%d 光强x100=%d 光柱x100=%d 阴影x100=%d 模式=%d",
+                 (int)(s->sunU * 1000), (int)(s->sunV * 1000), s->sunExact,
+                 (int)(s->glowA * 100), (int)(g_cfg_rays * 100),
+                 (int)(s->shadowK * 100), g_mode);
     }
 }
 
@@ -776,7 +893,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 7,
+    .version_code = 9,
     .api_version = 1,
     .version = MOD_VERSION,
 };
