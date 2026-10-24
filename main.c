@@ -4,12 +4,13 @@
 // 灵感来源：tModLoader 的「Lights And Shadows」(作者 yiyang233)。实现与参数自研。
 //
 // ---------------------------------------------------------------------------
-// v2.2：**只做光**（阴影部分已移除，交给游戏自带的光照）
+// v2.3：**只做光**（阴影部分已移除，交给游戏自带的光照）
 // ---------------------------------------------------------------------------
 //   绘制走原生 GL 屏幕后处理（eglSwapBuffers 钩子，在交换之前画）：
-//     · 日月柔光：太阳亮核 + 暖光晕 + 径向光芒 + 横向镜头光斑（加色 GL_ONE,GL_ONE）
-//     · 昼夜色罩：天空垂直渐变 + 暗角（乘法 GL_DST_COLOR），不糊
-//   乘法/加色一律用 BlendFuncSeparate，**不动这一帧的 alpha**（否则合成器可能整屏发黑）。
+//     · 屏幕空间体积光：把本帧拷成纹理，朝太阳径向累加采样，亮部拖出丁达尔光柱
+//     · 太阳光晕：亮核 + 暖光晕（加色）
+//     · 调色：天空垂直渐变 + 暗角（乘法）
+//   单趟后处理写回，不破坏 alpha。
 //
 //   状态由 Main.DrawInterface_36_Cursor 的 postfix 读出来写进快照（游戏线程），
 //   渲染线程只读快照 —— 避免跨线程读游戏数据。
@@ -42,15 +43,17 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.2.0-light"
+#define MOD_VERSION "2.3.0-light"
 
 /* ============================================================================
  * 可调参数：<私有目录>/ls_settings.txt（每 2 秒热读）
- *   glow=0.24   日月柔光强度（0 = 关掉光晕）
+ *   glow=0.20   太阳光晕强度（0 = 关掉光晕）
+ *   rays=0.55   体光/丁达尔光线强度（0 = 关掉）
  *   sun=-1      测试用：强制太阳时刻 0..1（<0 = 用游戏时间）
  * ========================================================================== */
 
-static float g_cfg_glow = 0.24f;
+static float g_cfg_glow = 0.20f;
+static float g_cfg_rays = 0.55f;
 static float g_cfg_sun = -1.0f;
 static char  g_private_dir[1024];
 
@@ -72,6 +75,7 @@ static void read_settings(void) {
         while (end > key && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
         float v = (float)atof(eq + 1);
         if (!strcmp(key, "glow")) g_cfg_glow = v;
+        else if (!strcmp(key, "rays")) g_cfg_rays = v;
         else if (!strcmp(key, "sun")) g_cfg_sun = v;
     }
     fclose(f);
@@ -249,20 +253,52 @@ static void compute_light(light_snap_t *s) {
 }
 
 /* ============================================================================
- * 四、GL 层：两个通道（色罩 / 柔光）
+ * 四、GL 层：单趟屏幕后处理（读回本帧 -> 体积光/光晕/调色 -> 写回）
+ *
+ *   MSAA 设备读不了默认帧缓冲，用 glBlitFramebuffer 把它解析到非多重采样的
+ *   FBO 纹理里再采样；解析/拷贝都失败时回退到「纯叠加」（光晕加色 + 色罩乘法），
+ *   保证屏幕不会黑。三个模式按 g_mode 记忆：
+ *     1 = 后处理（体积光）  2 = 纯叠加
  * ========================================================================== */
 
 static const float QUAD[8] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f };
 
 static int g_gl_state;
-static GLuint g_vbo, g_prog_tint, g_prog_glow;
+static int g_mode;              /* 1=后处理 2=纯叠加 */
+static GLuint g_vbo, g_prog_post, g_prog_tint, g_prog_glow, g_scene_tex, g_fbo;
+static int g_tex_w, g_tex_h;
+
+static GLint a_post, u_post_center, u_post_size, u_post_res, u_post_sun,
+             u_post_scene, u_post_glow_color, u_post_glow, u_post_rays,
+             u_post_top, u_post_bottom, u_post_vignette;
 static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
 static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
 
 #define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
+#define GL_FRAMEBUFFER       0x8D40
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_READ_FRAMEBUFFER  0x8CA8
+#define GL_DRAW_FRAMEBUFFER  0x8CA9
+#define GL_COLOR_BUFFER_BIT  0x00004000
+
 typedef void (*PFN_bindvao)(GLuint);
+typedef void (*PFN_genfb)(GLsizei, GLuint *);
+typedef void (*PFN_bindfb)(GLenum, GLuint);
+typedef void (*PFN_fbtex)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef void (*PFN_blit)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+
 static PFN_bindvao p_bind_vao;
+static PFN_genfb p_gen_fb;
+static PFN_bindfb p_bind_fb;
+static PFN_fbtex p_fb_tex;
+static PFN_blit p_blit;
+
+static void *proc(const char *a, const char *b) {
+    void *p = (void *)eglGetProcAddress(a);
+    if (p) return p;
+    return (void *)eglGetProcAddress(b);
+}
 
 static const char *VS_SRC =
     "attribute vec2 aPos;\n"
@@ -274,6 +310,7 @@ static const char *VS_SRC =
     "  gl_Position = vec4(uCenter + aPos * uSize, 0.0, 1.0);\n"
     "}\n";
 
+/* 纯叠加用的两段（回退路径，不读帧缓冲） */
 static const char *FS_TINT =
     "precision mediump float;\n"
     "uniform vec2 uRes;\n"
@@ -298,17 +335,52 @@ static const char *FS_GLOW =
     "void main(){\n"
     "  vec2 uv = gl_FragCoord.xy / uRes;\n"
     "  vec2 d = uv - uSun;\n"
-    "  d.x *= uRes.x / uRes.y;\n"              /* 圆化 */
+    "  d.x *= uRes.x / uRes.y;\n"
     "  float r = length(d);\n"
-    "  float core = smoothstep(0.06, 0.0, r);\n"        /* 太阳亮核 */
-    "  float halo = exp(-r * r * 8.0);\n"                /* 暖光晕 */
-    "  float ang = atan(d.y, d.x);\n"
-    "  float rays = pow(abs(cos(ang * 6.0)), 18.0) * exp(-r * 2.2) * 0.55;\n" /* 径向光芒 */
-    "  vec2 fd = d; fd.y *= 0.05;\n"
-    "  float streak = exp(-dot(fd, fd) * 220.0) * 0.5;\n"                    /* 横向光斑 */
-    "  float l = core * 1.2 + halo + rays + streak;\n"
-    "  vec3 col = uColor * (l * uStrength);\n"
-    "  col += vec3(1.0) * (core * uStrength * 0.7);\n"  /* 核心提白 */
+    "  float core = smoothstep(0.07, 0.0, r);\n"
+    "  float halo = exp(-r * r * 5.0);\n"
+    "  vec3 col = uColor * (core * 1.1 + halo) * uStrength;\n"
+    "  col += vec3(core * 0.8 * uStrength);\n"
+    "  gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
+
+/* 体积光后处理（需要场景纹理） */
+#define RAY_SAMPLES 14
+static const char *FS_POST =
+    "precision mediump float;\n"
+    "uniform sampler2D uScene;\n"
+    "uniform vec2 uRes;\n"
+    "uniform vec2 uSun;\n"
+    "uniform vec3 uGlowColor;\n"
+    "uniform float uGlow;\n"
+    "uniform float uRays;\n"
+    "uniform vec3 uTop;\n"
+    "uniform vec3 uBottom;\n"
+    "uniform float uVignette;\n"
+    "void main(){\n"
+    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
+    "  vec3 scene = texture2D(uScene, uv).rgb;\n"
+    "  vec2 d = uv - uSun;\n"
+    "  d.x *= uRes.x / uRes.y;\n"
+    "  float r = length(d);\n"
+    "  float core = smoothstep(0.07, 0.0, r);\n"
+    "  float halo = exp(-r * r * 5.0);\n"
+    "  vec3 glow = (uGlowColor * (core * 1.1 + halo) + vec3(core * 0.8)) * uGlow;\n"
+    "  vec2 step = (uv - uSun) / 14.0;\n"
+    "  vec2 p = uv;\n"
+    "  vec3 acc = vec3(0.0);\n"
+    "  float w = 1.0;\n"
+    "  for (int i = 0; i < 14; ++i) {\n"
+    "    p -= step;\n"
+    "    acc += texture2D(uScene, clamp(p, 0.0, 1.0)).rgb * w;\n"
+    "    w *= 0.92;\n"
+    "  }\n"
+    "  vec3 rays = acc * (uRays / 14.0);\n"
+    "  vec3 col = scene + glow + rays;\n"
+    "  vec3 grade = mix(uBottom, uTop, clamp(uv.y, 0.0, 1.0));\n"
+    "  vec2 q = uv - 0.5;\n"
+    "  grade *= clamp(1.0 - uVignette * dot(q, q) * 3.0, 0.0, 1.0);\n"
+    "  col *= grade;\n"
     "  gl_FragColor = vec4(col, 1.0);\n"
     "}\n";
 
@@ -356,21 +428,26 @@ static GLuint build_program(const char *fsrc, const char *tag) {
     return prog;
 }
 
-static void gl_setup_quad(GLuint prog, GLint apos, GLint ucen, GLint usz,
-                          float cx, float cy, float hw, float hh) {
-    glUseProgram(prog);
-    if (ucen >= 0) glUniform2f(ucen, cx, cy);
-    if (usz >= 0) glUniform2f(usz, hw, hh);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glEnableVertexAttribArray((GLuint)apos);
-    glVertexAttribPointer((GLuint)apos, 2, GL_FLOAT, GL_FALSE, 0, 0);
-}
-
 static bool gl_build(void) {
     if (g_gl_state != 0) return g_gl_state > 0;
-    g_prog_tint = build_program(FS_TINT, "整屏色罩");
-    g_prog_glow = build_program(FS_GLOW, "日月柔光");
-    if (!g_prog_tint || !g_prog_glow) { LOG_ERROR("GL 程序构建失败"); g_gl_state = -1; return false; }
+
+    g_prog_post = build_program(FS_POST, "体积光");
+    g_prog_tint = build_program(FS_TINT, "色罩");
+    g_prog_glow = build_program(FS_GLOW, "光晕");
+    if (!g_prog_post || !g_prog_tint || !g_prog_glow) { LOG_ERROR("GL 程序构建失败"); g_gl_state = -1; return false; }
+
+    a_post = glGetAttribLocation(g_prog_post, "aPos");
+    u_post_center = glGetUniformLocation(g_prog_post, "uCenter");
+    u_post_size = glGetUniformLocation(g_prog_post, "uSize");
+    u_post_res = glGetUniformLocation(g_prog_post, "uRes");
+    u_post_sun = glGetUniformLocation(g_prog_post, "uSun");
+    u_post_scene = glGetUniformLocation(g_prog_post, "uScene");
+    u_post_glow_color = glGetUniformLocation(g_prog_post, "uGlowColor");
+    u_post_glow = glGetUniformLocation(g_prog_post, "uGlow");
+    u_post_rays = glGetUniformLocation(g_prog_post, "uRays");
+    u_post_top = glGetUniformLocation(g_prog_post, "uTop");
+    u_post_bottom = glGetUniformLocation(g_prog_post, "uBottom");
+    u_post_vignette = glGetUniformLocation(g_prog_post, "uVignette");
 
     a_tint = glGetAttribLocation(g_prog_tint, "aPos");
     u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
@@ -388,19 +465,79 @@ static bool gl_build(void) {
     u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
     u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
 
-    if (a_tint < 0 || a_glow < 0) { LOG_ERROR("aPos 无效 %d/%d", a_tint, a_glow); g_gl_state = -1; return false; }
+    if (a_post < 0 || a_tint < 0 || a_glow < 0) { LOG_ERROR("aPos 无效"); g_gl_state = -1; return false; }
 
     glGenBuffers(1, &g_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    p_bind_vao = (PFN_bindvao)eglGetProcAddress("glBindVertexArrayOES");
-    if (!p_bind_vao) p_bind_vao = (PFN_bindvao)eglGetProcAddress("glBindVertexArray");
+    glGenTextures(1, &g_scene_tex);
+    glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    p_bind_vao = (PFN_bindvao)proc("glBindVertexArrayOES", "glBindVertexArray");
+    p_gen_fb   = (PFN_genfb)  proc("glGenFramebuffers", "glGenFramebuffersOES");
+    p_bind_fb  = (PFN_bindfb) proc("glBindFramebuffer", "glBindFramebufferOES");
+    p_fb_tex   = (PFN_fbtex)  proc("glFramebufferTexture2D", "glFramebufferTexture2DOES");
+    p_blit     = (PFN_blit)   eglGetProcAddress("glBlitFramebuffer");
+
+    g_fbo = 0;
+    if (p_gen_fb && p_bind_fb && p_fb_tex) {
+        p_gen_fb(1, &g_fbo);
+        p_bind_fb(GL_FRAMEBUFFER, g_fbo);
+        p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene_tex, 0);
+        p_bind_fb(GL_FRAMEBUFFER, 0);
+    }
 
     g_gl_state = 1;
-    LOG_INFO("GL 就绪 v%s", MOD_VERSION);
+    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u）", MOD_VERSION, p_blit ? 1 : 0, g_fbo);
     return true;
+}
+
+/* 决定用哪种模式：能读回场景就用体积光，否则纯叠加 */
+static int gl_probe_mode(int W, int H) {
+    glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+    if (g_tex_w != W || g_tex_h != H) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        g_tex_w = W; g_tex_h = H;
+    }
+
+    glGetError(); /* 清空旧错误 */
+    if (p_blit && g_fbo) {
+        p_bind_fb(GL_READ_FRAMEBUFFER, 0);
+        p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo);
+        p_blit(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        p_bind_fb(GL_FRAMEBUFFER, 0);
+        if (glGetError() == GL_NO_ERROR) {
+            LOG_INFO("MSAA 解析成功，启用体积光");
+            return 1;
+        }
+        glGetError();
+    }
+
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
+    if (glGetError() == GL_NO_ERROR) {
+        LOG_INFO("拷贝场景成功，启用体积光");
+        return 1;
+    }
+
+    LOG_ERROR("读场景失败，回退到纯叠加");
+    return 2;
+}
+
+static void gl_setup_quad(GLuint prog, GLint apos, GLint ucen, GLint usz,
+                          float cx, float cy, float hw, float hh) {
+    glUseProgram(prog);
+    if (ucen >= 0) glUniform2f(ucen, cx, cy);
+    if (usz >= 0) glUniform2f(usz, hw, hh);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glEnableVertexAttribArray((GLuint)apos);
+    glVertexAttribPointer((GLuint)apos, 2, GL_FLOAT, GL_FALSE, 0, 0);
 }
 
 static void gl_render(const light_snap_t *s) {
@@ -440,30 +577,67 @@ static void gl_render(const light_snap_t *s) {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
-    glEnable(GL_BLEND);
-    glBlendEquation(GL_FUNC_ADD);
     glViewport(0, 0, W, H);
     glActiveTexture(GL_TEXTURE0);
 
-    /* 色罩（乘法；alpha 保持不动） */
-    glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
-    gl_setup_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 0.f, 0.f, 1.f, 1.f);
-    glUniform2f(u_tint_res, (float)W, (float)H);
-    glUniform3f(u_tint_top, s->topR, s->topG, s->topB);
-    glUniform3f(u_tint_bottom, s->botR, s->botG, s->botB);
-    glUniform1f(u_tint_vignette, s->vignette);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (g_mode == 0) g_mode = gl_probe_mode(W, H);
 
-    /* 日月柔光（加色；alpha 保持不动） */
-    if (s->glowA > 0.004f && s->sunU > -0.35f && s->sunU < 1.35f &&
-        s->sunV > -0.35f && s->sunV < 1.35f) {
-        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
-        gl_setup_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 0.f, 0.f, 1.f, 1.f);
-        glUniform2f(u_glow_res, (float)W, (float)H);
-        glUniform2f(u_glow_sun, s->sunU, s->sunV);
-        glUniform3f(u_glow_color, s->warmR, s->warmG, s->warmB);
-        glUniform1f(u_glow_strength, s->glowA);
+    if (g_mode == 1) {
+        /* —— 体积光：覆盖写回 —— */
+        glDisable(GL_BLEND);
+        glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+        if (g_tex_w != W || g_tex_h != H) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            g_tex_w = W; g_tex_h = H;
+        }
+        if (p_blit && g_fbo) {
+            p_bind_fb(GL_READ_FRAMEBUFFER, 0);
+            p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo);
+            p_blit(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            p_bind_fb(GL_FRAMEBUFFER, 0);
+        } else {
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
+        }
+
+        glUseProgram(g_prog_post);
+        glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+        glEnableVertexAttribArray((GLuint)a_post);
+        glVertexAttribPointer((GLuint)a_post, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glUniform2f(u_post_center, 0.f, 0.f);
+        glUniform2f(u_post_size, 1.f, 1.f);
+        glUniform2f(u_post_res, (float)W, (float)H);
+        glUniform2f(u_post_sun, s->sunU, s->sunV);
+        glUniform1i(u_post_scene, 0);
+        glUniform3f(u_post_glow_color, s->warmR, s->warmG, s->warmB);
+        glUniform1f(u_post_glow, s->glowA);
+        glUniform1f(u_post_rays, g_cfg_rays);
+        glUniform3f(u_post_top, s->topR, s->topG, s->topB);
+        glUniform3f(u_post_bottom, s->botR, s->botG, s->botB);
+        glUniform1f(u_post_vignette, s->vignette);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    } else {
+        /* —— 纯叠加：光晕加色 + 色罩乘法（不读帧缓冲） —— */
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+
+        glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
+        gl_setup_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 0.f, 0.f, 1.f, 1.f);
+        glUniform2f(u_tint_res, (float)W, (float)H);
+        glUniform3f(u_tint_top, s->topR, s->topG, s->topB);
+        glUniform3f(u_tint_bottom, s->botR, s->botG, s->botB);
+        glUniform1f(u_tint_vignette, s->vignette);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        if (s->glowA > 0.004f && s->sunU > -0.35f && s->sunU < 1.35f &&
+            s->sunV > -0.35f && s->sunV < 1.35f) {
+            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+            gl_setup_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 0.f, 0.f, 1.f, 1.f);
+            glUniform2f(u_glow_res, (float)W, (float)H);
+            glUniform2f(u_glow_sun, s->sunU, s->sunV);
+            glUniform3f(u_glow_color, s->warmR, s->warmG, s->warmB);
+            glUniform1f(u_glow_strength, s->glowA);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
     }
 
     if (p_bind_vao && pVao) p_bind_vao((GLuint)pVao);
@@ -602,7 +776,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 6,
+    .version_code = 7,
     .api_version = 1,
     .version = MOD_VERSION,
 };
