@@ -4,11 +4,11 @@
 // 灵感来源：tModLoader 的「Lights And Shadows」(作者 yiyang233)。实现与参数自研。
 //
 // ---------------------------------------------------------------------------
-// v2.1：**只做光**（阴影部分已移除，交给游戏自带的光照）
+// v2.2：**只做光**（阴影部分已移除，交给游戏自带的光照）
 // ---------------------------------------------------------------------------
 //   绘制走原生 GL 屏幕后处理（eglSwapBuffers 钩子，在交换之前画）：
-//     · 日月柔光：片元里算径向衰减，glBlendFunc(GL_ONE, GL_ONE) 真·加色提亮
-//     · 昼夜色罩：整屏乘法（GL_DST_COLOR），只按比例压，不糊
+//     · 日月柔光：太阳亮核 + 暖光晕 + 径向光芒 + 横向镜头光斑（加色 GL_ONE,GL_ONE）
+//     · 昼夜色罩：天空垂直渐变 + 暗角（乘法 GL_DST_COLOR），不糊
 //   乘法/加色一律用 BlendFuncSeparate，**不动这一帧的 alpha**（否则合成器可能整屏发黑）。
 //
 //   状态由 Main.DrawInterface_36_Cursor 的 postfix 读出来写进快照（游戏线程），
@@ -42,7 +42,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.1.0-light"
+#define MOD_VERSION "2.2.0-light"
 
 /* ============================================================================
  * 可调参数：<私有目录>/ls_settings.txt（每 2 秒热读）
@@ -164,7 +164,9 @@ typedef struct {
     float sunU, sunV;            /* 太阳在 GL UV 里的位置（y 向上） */
     float warmR, warmG, warmB;   /* 光晕颜色 */
     float glowA;                 /* 光晕强度 */
-    float tintR, tintG, tintB;   /* 整屏乘法色罩 */
+    float topR, topG, topB;      /* 天空顶部色（乘法） */
+    float botR, botG, botB;      /* 地平线色（乘法） */
+    float vignette;              /* 暗角强度 0..1 */
 } light_snap_t;
 
 static light_snap_t g_snap[2];
@@ -223,17 +225,26 @@ static void compute_light(light_snap_t *s) {
     s->glowA = intensity * g_cfg_glow;
     if (s->glowA > 0.55f) s->glowA = 0.55f;
 
-    /* 整屏乘法色罩：白天几乎不变，黄昏偏暖、夜里偏冷蓝 */
+    /* 整屏乘法色罩：天空垂直渐变 + 暗角。
+     * 白天顶部略偏冷、地平线随日落渐暖；夜里顶部深蓝、地平线稍亮。 */
     if (day) {
-        float d = 1.0f - lift;
-        s->tintR = 1.00f;
-        s->tintG = 1.00f - 0.07f * d;
-        s->tintB = 1.00f - 0.16f * d;
+        float d = 1.0f - lift;               /* 越接近日落 d 越大 */
+        s->topR = 0.90f;
+        s->topG = 0.95f;
+        s->topB = 1.02f;
+        s->botR = 1.00f;
+        s->botG = 0.98f - 0.16f * d;
+        s->botB = 0.90f - 0.32f * d;
+        s->vignette = 0.18f;
     } else {
-        float k = 0.86f + 0.10f * moonK;
-        s->tintR = 0.72f * k;
-        s->tintG = 0.78f * k;
-        s->tintB = 0.95f * k;
+        float k = 0.90f + 0.10f * moonK;
+        s->topR = 0.30f * k;
+        s->topG = 0.42f * k;
+        s->topB = 0.74f * k;
+        s->botR = 0.46f * k;
+        s->botG = 0.53f * k;
+        s->botB = 0.86f * k;
+        s->vignette = 0.30f;
     }
 }
 
@@ -245,8 +256,8 @@ static const float QUAD[8] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f };
 
 static int g_gl_state;
 static GLuint g_vbo, g_prog_tint, g_prog_glow;
-static GLint a_tint, u_tint_center, u_tint_size, u_tint_color;
-static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun, u_glow_aspect,
+static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
+static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
 
 #define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
@@ -265,26 +276,40 @@ static const char *VS_SRC =
 
 static const char *FS_TINT =
     "precision mediump float;\n"
-    "uniform vec3 uColor;\n"
+    "uniform vec2 uRes;\n"
+    "uniform vec3 uTop;\n"
+    "uniform vec3 uBottom;\n"
+    "uniform float uVignette;\n"
     "void main(){\n"
-    "  gl_FragColor = vec4(uColor, 1.0);\n"
+    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
+    "  vec3 c = mix(uBottom, uTop, clamp(uv.y, 0.0, 1.0));\n"
+    "  vec2 q = uv - 0.5;\n"
+    "  float vig = 1.0 - uVignette * dot(q, q) * 3.0;\n"
+    "  c *= clamp(vig, 0.0, 1.0);\n"
+    "  gl_FragColor = vec4(c, 1.0);\n"
     "}\n";
 
 static const char *FS_GLOW =
     "precision mediump float;\n"
     "uniform vec2 uRes;\n"
     "uniform vec2 uSun;\n"
-    "uniform float uAspect;\n"
     "uniform vec3 uColor;\n"
     "uniform float uStrength;\n"
     "void main(){\n"
-    "  vec2 p = gl_FragCoord.xy / uRes;\n"
-    "  vec2 d = p - uSun;\n"
-    "  d.x *= uAspect;\n"
+    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
+    "  vec2 d = uv - uSun;\n"
+    "  d.x *= uRes.x / uRes.y;\n"              /* 圆化 */
     "  float r = length(d);\n"
-    "  float f = max(0.0, 1.0 - r);\n"
-    "  f = pow(f, 1.6);\n"
-    "  gl_FragColor = vec4(uColor * (f * uStrength), 1.0);\n"
+    "  float core = smoothstep(0.06, 0.0, r);\n"        /* 太阳亮核 */
+    "  float halo = exp(-r * r * 8.0);\n"                /* 暖光晕 */
+    "  float ang = atan(d.y, d.x);\n"
+    "  float rays = pow(abs(cos(ang * 6.0)), 18.0) * exp(-r * 2.2) * 0.55;\n" /* 径向光芒 */
+    "  vec2 fd = d; fd.y *= 0.05;\n"
+    "  float streak = exp(-dot(fd, fd) * 220.0) * 0.5;\n"                    /* 横向光斑 */
+    "  float l = core * 1.2 + halo + rays + streak;\n"
+    "  vec3 col = uColor * (l * uStrength);\n"
+    "  col += vec3(1.0) * (core * uStrength * 0.7);\n"  /* 核心提白 */
+    "  gl_FragColor = vec4(col, 1.0);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src, const char *tag) {
@@ -350,14 +375,16 @@ static bool gl_build(void) {
     a_tint = glGetAttribLocation(g_prog_tint, "aPos");
     u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
     u_tint_size = glGetUniformLocation(g_prog_tint, "uSize");
-    u_tint_color = glGetUniformLocation(g_prog_tint, "uColor");
+    u_tint_res = glGetUniformLocation(g_prog_tint, "uRes");
+    u_tint_top = glGetUniformLocation(g_prog_tint, "uTop");
+    u_tint_bottom = glGetUniformLocation(g_prog_tint, "uBottom");
+    u_tint_vignette = glGetUniformLocation(g_prog_tint, "uVignette");
 
     a_glow = glGetAttribLocation(g_prog_glow, "aPos");
     u_glow_center = glGetUniformLocation(g_prog_glow, "uCenter");
     u_glow_size = glGetUniformLocation(g_prog_glow, "uSize");
     u_glow_res = glGetUniformLocation(g_prog_glow, "uRes");
     u_glow_sun = glGetUniformLocation(g_prog_glow, "uSun");
-    u_glow_aspect = glGetUniformLocation(g_prog_glow, "uAspect");
     u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
     u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
 
@@ -421,7 +448,10 @@ static void gl_render(const light_snap_t *s) {
     /* 色罩（乘法；alpha 保持不动） */
     glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
     gl_setup_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 0.f, 0.f, 1.f, 1.f);
-    glUniform3f(u_tint_color, s->tintR, s->tintG, s->tintB);
+    glUniform2f(u_tint_res, (float)W, (float)H);
+    glUniform3f(u_tint_top, s->topR, s->topG, s->topB);
+    glUniform3f(u_tint_bottom, s->botR, s->botG, s->botB);
+    glUniform1f(u_tint_vignette, s->vignette);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     /* 日月柔光（加色；alpha 保持不动） */
@@ -431,7 +461,6 @@ static void gl_render(const light_snap_t *s) {
         gl_setup_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 0.f, 0.f, 1.f, 1.f);
         glUniform2f(u_glow_res, (float)W, (float)H);
         glUniform2f(u_glow_sun, s->sunU, s->sunV);
-        glUniform1f(u_glow_aspect, (float)W / (float)H);
         glUniform3f(u_glow_color, s->warmR, s->warmG, s->warmB);
         glUniform1f(u_glow_strength, s->glowA);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -561,9 +590,9 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
     snap_commit();
 
     if ((g_frames % 600) == 1) {
-        LOG_INFO("太阳uvx1000=(%d,%d) 光晕x100=%d 色罩x100=%d",
+        LOG_INFO("太阳uvx1000=(%d,%d) 光晕x100=%d 地色x100=%d 暗角x100=%d",
                  (int)(s->sunU * 1000), (int)(s->sunV * 1000),
-                 (int)(s->glowA * 100), (int)(s->tintR * 100));
+                 (int)(s->glowA * 100), (int)(s->botR * 100), (int)(s->vignette * 100));
     }
 }
 
@@ -573,7 +602,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 5,
+    .version_code = 6,
     .api_version = 1,
     .version = MOD_VERSION,
 };
