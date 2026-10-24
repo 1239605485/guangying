@@ -48,21 +48,157 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.4.1-light"
+#define MOD_VERSION "2.5.0-light"
 
 /* ============================================================================
- * 可调参数：<私有目录>/ls_settings.txt（每 2 秒热读）
- *   glow=0.60   太阳光（宽光晕）强度（0 = 关掉）
- *   rays=0.55   阴影条纹/光柱强度（0 = 关掉，只剩光晕）
- *   sun=-1      测试用：强制太阳时刻 0..1（<0 = 用游戏时间）
+ * 配置
+ *   首选：TEFManager 设置界面 → <私有目录>/config.json（改完重启游戏生效）
+ *   调试：<私有目录>/ls_settings.txt，覆盖同名字段（不用重装包）
+ *
+ * config.json（TEFManager 生成）：
+ *   {"schemaVersion":1,"values":{"enabled":true,"quality":"balanced",
+ *    "ray_samples":16,"shadow_div":3,"glow":60,"rays":55}}
+ *
+ * ls_settings.txt：
+ *   glow=0.60   光晕强度（0 = 关掉）
+ *   rays=0.55   光柱强度（0 = 关掉，只剩光晕）
+ *   taps=16     光柱采样数 4..30（越大越细腻、越慢）
+ *   shadow=3    阴影降采样倍数 2..6（越小越清晰、越慢）
+ *   sun=-1      调试：强制太阳时刻 0..1（<0 = 用游戏时间）
  * ========================================================================== */
 
-static float g_cfg_glow = 0.60f;
-static float g_cfg_rays = 0.55f;
-static float g_cfg_sun = -1.0f;
+enum { Q_PERF = 0, Q_BALANCED = 1, Q_VISUAL = 2, Q_CUSTOM = 3 };
+
+static int   g_enabled    = 1;
+static int   g_quality    = Q_BALANCED;
+static int   g_taps       = 16;     /* 光柱采样数，决定用哪份着色器 */
+static int   g_shadow_div = 3;      /* 阴影图 = 画面 1/N */
+static float g_cfg_glow   = 0.60f;
+static float g_cfg_rays   = 0.55f;
+static float g_cfg_sun    = -1.0f;
 static char  g_private_dir[1024];
 
-static void read_settings(void) {
+static const char *quality_name(int q) {
+    switch (q) {
+        case Q_PERF:   return "性能";
+        case Q_VISUAL: return "视觉";
+        case Q_CUSTOM: return "自定义";
+        default:       return "平衡";
+    }
+}
+
+static float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* 档位 → 具体参数；自定义档直接用界面里填的四个值 */
+static void apply_preset(int q, int taps, int div, float glow, float rays) {
+    switch (q) {
+        case Q_PERF:   taps = 8;  div = 5; glow = 0.60f; rays = 0.55f; break;
+        case Q_VISUAL: taps = 30; div = 2; glow = 0.65f; rays = 0.70f; break;
+        case Q_CUSTOM: break;
+        default:       taps = 16; div = 3; glow = 0.60f; rays = 0.55f; break;
+    }
+    if (taps < 4) taps = 4;
+    if (taps > 30) taps = 30;
+    if (div < 2) div = 2;
+    if (div > 6) div = 6;
+    g_taps       = taps;
+    g_shadow_div = div;
+    g_cfg_glow   = clampf(glow, 0.0f, 1.5f);
+    g_cfg_rays   = clampf(rays, 0.0f, 1.5f);
+}
+
+/* —— 极简 JSON 取值：config.json 结构固定，不做通用解析 —— */
+static char *read_whole_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0 || n > 65536) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    buf[got] = 0;
+    fclose(f);
+    return buf;
+}
+
+static const char *json_value(const char *obj, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(obj, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p != ':') return NULL;
+    ++p;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    return p;
+}
+
+static int json_int(const char *o, const char *k, int d) {
+    const char *v = json_value(o, k);
+    if (!v) return d;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v) return d;
+    return (int)n;
+}
+
+static int json_bool(const char *o, const char *k, int d) {
+    const char *v = json_value(o, k);
+    if (!v) return d;
+    if (v[0] == 't' || v[0] == 'T' || v[0] == '1') return 1;
+    if (v[0] == 'f' || v[0] == 'F' || v[0] == '0') return 0;
+    return d;
+}
+
+static void json_str(const char *o, const char *k, char *out, size_t cap, const char *d) {
+    const char *v = json_value(o, k);
+    snprintf(out, cap, "%s", d);
+    if (!v || *v != '"') return;
+    ++v;
+    size_t i = 0;
+    while (*v && *v != '"' && i + 1 < cap) out[i++] = *v++;
+    out[i] = 0;
+}
+
+static void read_config_json(void) {
+    char path[1200];
+    int taps = 16, div = 3, glow = 60, rays = 55;
+    g_enabled = 1;
+    g_quality = Q_BALANCED;
+
+    if (g_private_dir[0]) {
+        snprintf(path, sizeof(path), "%s/config.json", g_private_dir);
+        char *buf = read_whole_file(path);
+        if (buf) {
+            const char *vals = strstr(buf, "\"values\"");
+            const char *o = vals ? vals : buf;
+
+            g_enabled = json_bool(o, "enabled", 1) ? 1 : 0;
+            taps = json_int(o, "ray_samples", 16);
+            div  = json_int(o, "shadow_div", 3);
+            glow = json_int(o, "glow", 60);
+            rays = json_int(o, "rays", 55);
+
+            char q[16];
+            json_str(o, "quality", q, sizeof(q), "balanced");
+            if (!strcmp(q, "perf") || !strcmp(q, "performance")) g_quality = Q_PERF;
+            else if (!strcmp(q, "visual")) g_quality = Q_VISUAL;
+            else if (!strcmp(q, "custom")) g_quality = Q_CUSTOM;
+            else g_quality = Q_BALANCED;
+
+            free(buf);
+        }
+    }
+    apply_preset(g_quality, taps, div, (float)glow / 100.0f, (float)rays / 100.0f);
+}
+
+/* 调试覆盖：ls_settings.txt（可选，写什么覆盖什么） */
+static void read_settings_txt(void) {
     if (!g_private_dir[0]) return;
     char path[1200];
     snprintf(path, sizeof(path), "%s/ls_settings.txt", g_private_dir);
@@ -79,8 +215,10 @@ static void read_settings(void) {
         char *end = key + strlen(key);
         while (end > key && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
         float v = (float)atof(eq + 1);
-        if (!strcmp(key, "glow")) g_cfg_glow = v;
-        else if (!strcmp(key, "rays")) g_cfg_rays = v;
+        if (!strcmp(key, "glow")) g_cfg_glow = clampf(v, 0.0f, 1.5f);
+        else if (!strcmp(key, "rays")) g_cfg_rays = clampf(v, 0.0f, 1.5f);
+        else if (!strcmp(key, "taps")) g_taps = (int)clampf(v, 4.0f, 30.0f);
+        else if (!strcmp(key, "shadow")) g_shadow_div = (int)clampf(v, 2.0f, 6.0f);
         else if (!strcmp(key, "sun")) g_cfg_sun = v;
     }
     fclose(f);
@@ -320,14 +458,20 @@ static int g_gl_state;
 static int g_mode;
 static int g_use_blit;
 static GLuint g_vbo;
-static GLuint g_prog_post, g_prog_tint, g_prog_glow, g_prog_shadow;
+static GLuint g_prog_tint, g_prog_glow, g_prog_shadow;
 static GLuint g_scene_tex, g_shadow_tex;
 static GLuint g_fbo_scene, g_fbo_shadow;
 static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h;
 
-static GLint a_post, u_post_scene, u_post_shadow, u_post_res, u_post_sun,
-             u_post_color, u_post_beam, u_post_rays, u_post_shadow_k, u_post_zoom,
-             u_post_center, u_post_size;
+/* 光柱采样数是着色器里的循环上界，必须编译期常量；
+ * 所以每档采样数各编译一份，只在用到的档位编一次（一局只编一份）。 */
+typedef struct {
+    GLuint prog;
+    GLint  apos, center, size, scene, shadow, res, sun, color, beam, rays, shadow_k, zoom;
+    int    taps;
+    int    state;                 /* 0=未编译 1=可用 -1=失败 */
+} post_variant_t;
+static post_variant_t g_post_variant;
 static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
 static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
@@ -435,7 +579,7 @@ static const char *FS_POST =
     "  float fade = max(0.0, 1.0 - r / 1.15);\n"
     "  float fall = fade * fade;\n"
     "  float shade = 0.0;\n"
-    "  for (int i = 0; i < 30; ++i) {\n"
+    "  for (int i = 0; i < RAY_TAPS; ++i) {\n"
     "    float k = 1.0 + float(i) * uZoom;\n"
     "    vec2 p = uSun + (uv - uSun) / k;\n"
     "    shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
@@ -489,31 +633,81 @@ static GLuint build_program(const char *fsrc, const char *tag) {
     return prog;
 }
 
+static int post_build(post_variant_t *v, int taps) {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "#define RAY_TAPS %d\n", taps);
+
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, VS_SRC, "VS");
+    if (!vs) return -1;
+    char src[8192];
+    int n = snprintf(src, sizeof(src), "%s%s", hdr, FS_POST);
+    if (n <= 0 || (size_t)n >= sizeof(src)) { glDeleteShader(vs); return -1; }
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, src, "光-阴影");
+    if (!fs) { glDeleteShader(vs); return -1; }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        GLsizei ln = 0;
+        glGetProgramInfoLog(prog, sizeof(log) - 1, &ln, log);
+        log[ln < 0 ? 0 : ln] = 0;
+        LOG_ERROR("程序链接失败 光-阴影: %s", log);
+        glDeleteProgram(prog);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return -1;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    memset(v, 0, sizeof(*v));
+    v->prog      = prog;
+    v->taps      = taps;
+    v->apos      = glGetAttribLocation(prog, "aPos");
+    v->scene     = glGetUniformLocation(prog, "uScene");
+    v->shadow    = glGetUniformLocation(prog, "uShadow");
+    v->res       = glGetUniformLocation(prog, "uRes");
+    v->sun       = glGetUniformLocation(prog, "uSun");
+    v->color     = glGetUniformLocation(prog, "uColor");
+    v->beam      = glGetUniformLocation(prog, "uBeam");
+    v->rays      = glGetUniformLocation(prog, "uRays");
+    v->shadow_k  = glGetUniformLocation(prog, "uShadowK");
+    v->zoom      = glGetUniformLocation(prog, "uZoom");
+    v->center    = glGetUniformLocation(prog, "uCenter");
+    v->size      = glGetUniformLocation(prog, "uSize");
+    if (v->apos < 0) {
+        LOG_ERROR("后处理 aPos 无效（%d 采样）", taps);
+        glDeleteProgram(prog);
+        return -1;
+    }
+    LOG_INFO("后处理就绪：%d 采样", taps);
+    return 0;
+}
+
+static post_variant_t *post_get(int taps) {
+    if (g_post_variant.state == 0) {
+        g_post_variant.state = (post_build(&g_post_variant, taps) == 0) ? 1 : -1;
+    }
+    if (g_post_variant.state < 0) return NULL;
+    return &g_post_variant;
+}
+
 static bool gl_build(void) {
     if (g_gl_state != 0) return g_gl_state > 0;
 
-    g_prog_post   = build_program(FS_POST,   "光-阴影");
     g_prog_shadow = build_program(FS_SHADOW, "阴影");
     g_prog_tint   = build_program(FS_TINT,   "色罩");
     g_prog_glow   = build_program(FS_GLOW,   "光晕");
-    if (!g_prog_post || !g_prog_shadow || !g_prog_tint || !g_prog_glow) {
+    if (!g_prog_shadow || !g_prog_tint || !g_prog_glow) {
         LOG_ERROR("GL 程序构建失败");
         g_gl_state = -1;
         return false;
     }
-
-    a_post = glGetAttribLocation(g_prog_post, "aPos");
-    u_post_scene    = glGetUniformLocation(g_prog_post, "uScene");
-    u_post_shadow   = glGetUniformLocation(g_prog_post, "uShadow");
-    u_post_res      = glGetUniformLocation(g_prog_post, "uRes");
-    u_post_sun      = glGetUniformLocation(g_prog_post, "uSun");
-    u_post_color    = glGetUniformLocation(g_prog_post, "uColor");
-    u_post_beam     = glGetUniformLocation(g_prog_post, "uBeam");
-    u_post_rays     = glGetUniformLocation(g_prog_post, "uRays");
-    u_post_shadow_k = glGetUniformLocation(g_prog_post, "uShadowK");
-    u_post_zoom     = glGetUniformLocation(g_prog_post, "uZoom");
-    u_post_center   = glGetUniformLocation(g_prog_post, "uCenter");
-    u_post_size     = glGetUniformLocation(g_prog_post, "uSize");
 
     a_shadow      = glGetAttribLocation(g_prog_shadow, "aPos");
     u_shadow_scene = glGetUniformLocation(g_prog_shadow, "uScene");
@@ -538,7 +732,7 @@ static bool gl_build(void) {
     u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
     u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
 
-    if (a_post < 0 || a_shadow < 0 || a_tint < 0 || a_glow < 0) {
+    if (a_shadow < 0 || a_tint < 0 || a_glow < 0) {
         LOG_ERROR("aPos 无效");
         g_gl_state = -1;
         return false;
@@ -688,9 +882,12 @@ static void gl_render(const light_snap_t *s) {
 
     if (g_mode == 0) g_mode = gl_probe_mode(W, H);
 
+    post_variant_t *pp = post_get(g_taps);
+    if (!pp) g_mode = 2;   /* 后处理程序编不出来就走纯叠加，不能黑屏 */
+
     if (g_mode == 1 && fill_scene(W, H)) {
-        /* —— 阴影：场景缩到 1/3，按蓝色通道取阴影 —— */
-        int sw = W / 3, sh = H / 3;
+        /* —— 阴影：场景按档位降采样，按蓝色通道取阴影 —— */
+        int sw = W / g_shadow_div, sh = H / g_shadow_div;
         if (sw < 1) sw = 1;
         if (sh < 1) sh = 1;
         if (g_fbo_shadow && p_bind_fb) {
@@ -717,20 +914,21 @@ static void gl_render(const light_snap_t *s) {
 
         /* —— 合成：光晕 − 条纹，additive 叠回 —— */
         glDisable(GL_BLEND);
-        bind_quad(g_prog_post, a_post, u_post_center, u_post_size, 1.f, 1.f);
+        bind_quad(pp->prog, pp->apos, pp->center, pp->size, 1.f, 1.f);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-        glUniform1i(u_post_scene, 0);
+        glUniform1i(pp->scene, 0);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
-        glUniform1i(u_post_shadow, 1);
-        glUniform2f(u_post_res, (float)W, (float)H);
-        glUniform2f(u_post_sun, s->sunU, s->sunV);
-        glUniform3f(u_post_color, s->warmR, s->warmG, s->warmB);
-        glUniform1f(u_post_beam, s->glowA);
-        glUniform1f(u_post_rays, g_cfg_rays);
-        glUniform1f(u_post_shadow_k, s->shadowK);
-        glUniform1f(u_post_zoom, 0.111f);
+        glUniform1i(pp->shadow, 1);
+        glUniform2f(pp->res, (float)W, (float)H);
+        glUniform2f(pp->sun, s->sunU, s->sunV);
+        glUniform3f(pp->color, s->warmR, s->warmG, s->warmB);
+        glUniform1f(pp->beam, s->glowA);
+        glUniform1f(pp->rays, g_cfg_rays);
+        glUniform1f(pp->shadow_k, s->shadowK);
+        /* 采样少的时候把步长拉大，让光柱长度和 30 采样时接近 */
+        glUniform1f(pp->zoom, 3.2f / (float)pp->taps);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -854,6 +1052,8 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
     light_snap_t *s = snap_back();
     memset(s, 0, sizeof(*s));
 
+    if (!g_enabled) { snap_commit(); return; }
+
     int sw = main_int("screenWidth", 0), sh = main_int("screenHeight", 0);
     if (sw <= 0 || sh <= 0) { snap_commit(); return; }
     s->virtW = sw;
@@ -885,8 +1085,9 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
     snap_commit();
 
     if ((g_frames % 600) == 1) {
-        LOG_INFO("太阳uvx1000=(%d,%d) 真实=%d 光强x100=%d 光柱x100=%d 阴影x100=%d 模式=%d",
-                 (int)(s->sunU * 1000), (int)(s->sunV * 1000), s->sunExact,
+        LOG_INFO("档位=%s 采样=%d 阴影=1/%d 太阳uvx1000=(%d,%d) 光强x100=%d 光柱x100=%d 阴影x100=%d 模式=%d",
+                 quality_name(g_quality), g_taps, g_shadow_div,
+                 (int)(s->sunU * 1000), (int)(s->sunV * 1000),
                  (int)(s->glowA * 100), (int)(g_cfg_rays * 100),
                  (int)(s->shadowK * 100), g_mode);
     }
@@ -898,7 +1099,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 10,
+    .version_code = 11,
     .api_version = 1,
     .version = MOD_VERSION,
 };
@@ -921,7 +1122,11 @@ static void init_mod(kernel_mod_handle_t *handle) {
 
     if (!install_swap_hook()) LOG_ERROR("eglSwapBuffers 钩子安装失败");
 
-    read_settings();
+    read_config_json();
+    read_settings_txt();
+    LOG_INFO("配置：%s 档（采样=%d 阴影=1/%d 光晕=%.2f 光柱=%.2f）%s",
+             quality_name(g_quality), g_taps, g_shadow_div,
+             g_cfg_glow, g_cfg_rays, g_enabled ? "" : " — 已关闭，不绘制");
     LOG_INFO("初始化完成 v%s（快照 hook=%d swap=%d）", MOD_VERSION, (int)g_hook_draw,
              g_hook_installed ? 1 : 0);
 }
