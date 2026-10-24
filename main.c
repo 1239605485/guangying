@@ -223,30 +223,25 @@ static void compute_light(light_snap_t *s) {
 
     float ang = 3.14159265f * t01;   /* 光强/月相都按这个时刻算 */
 
-    /* 太阳位置：直接用游戏自己算好的归一化位置，和天空里那颗太阳严丝合缝。
-     * 拿不到再用圆弧兜底；兜底时不画实心亮核，免得天上出现第二颗太阳。 */
-    float sx = 0.0f, sy = 0.0f;
-    int exact = main_vec2("LastCelestialBodyPosition", &sx, &sy) &&
-                !(sx == 0.0f && sy == 0.0f);
-    if (exact) {
-        /* 有的版本给的是像素坐标，按屏幕尺寸归一化 */
-        if (sx < -1.5f || sx > 1.5f || sy < -1.5f || sy > 1.5f) {
-            sx /= (float)sw;
-            sy /= (float)sh;
-        }
-        if (!isfinite(sx) || !isfinite(sy) ||
-            sx < -1.0f || sx > 2.0f || sy < -1.0f || sy > 2.0f) exact = 0;
+    /* 太阳位置：照原版 GetSunPos 的算法推（t 取到正午=屏幕中线，上下随镜头高度偏移）。
+     * 不读 LastCelestialBodyPosition —— 那个值在 PE 上会被背景视差临时改写，读出来是跳的。 */
+    double ws = main_double("worldSurface", 0.0);
+    float camY = 0.0f, camX = 0.0f;
+    if (!main_vec2("screenPosition", &camX, &camY)) camY = 0.0f;
+    float skyShift = 0.0f;
+    if (ws > 10.0) skyShift = (-camY) / (float)(ws * 16.0 - 600.0) * 200.0f;
+    float halfDay = day ? 27000.0f : 16200.0f;
+    float k = 1.0f - (float)(time / halfDay);   /* 1=日出/月出  0=正中  -1=日落 */
+    float px = (1.0f - k) * (float)sw * 0.5f - 100.0f * k;
+    float py = skyShift + k * k * 250.0f + 180.0f;
+    s->sunU = px / (float)sw;
+    s->sunV = 1.0f - py / (float)sh;
+    s->sunExact = 1;
+
+    if ((g_frames % 600) == 1) {
+        LOG_INFO("太阳诊断：k=%.2f 时间=%.0f 白天=%d 相机y=%.0f 世界表面=%.1f 屏幕=%dx%d",
+                 k, time, day ? 1 : 0, camY, ws, sw, sh);
     }
-    if (exact) {
-        s->sunU = sx;
-        s->sunV = 1.0f - sy;
-    } else {
-        float arcW = sw * 0.5f + 160.0f;
-        float baseY = sh * 0.62f;
-        s->sunU = (sw * 0.5f - cosf(ang) * arcW) / (float)sw;
-        s->sunV = 1.0f - (baseY - sinf(ang) * (sh * 0.42f)) / (float)sh;
-    }
-    s->sunExact = exact;
     /* 阴影：白天按蓝色通道（天空很蓝，b≈0.75；树/地面 b≈0.2）取阈值；
      * 夜里整屏都暗，蓝通道区分不出天空，直接把条纹关掉 */
     s->shadowM = day ? 0.50f : 0.02f;
@@ -435,7 +430,7 @@ static const char *FS_POST =
     "  vec3 scene = texture2D(uScene, uv).rgb;\n"
     "  vec2 d = (uv - uSun) * vec2(uRes.x / uRes.y, 1.0);\n"
     "  float r = length(d);\n"
-    "  float fall = max(0.0, (3.0 - r) / 3.0);\n"
+    "  float fall = exp(-r * r * 2.5);\n"
     "  float streak = 0.0;\n"
     "  for (int i = 0; i < 30; ++i) {\n"
     "    float k = 1.0 + float(i) * uZoom;\n"
