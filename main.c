@@ -48,7 +48,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.4.0-light"
+#define MOD_VERSION "2.4.1-light"
 
 /* ============================================================================
  * 可调参数：<私有目录>/ls_settings.txt（每 2 秒热读）
@@ -326,11 +326,13 @@ static GLuint g_fbo_scene, g_fbo_shadow;
 static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h;
 
 static GLint a_post, u_post_scene, u_post_shadow, u_post_res, u_post_sun,
-             u_post_color, u_post_beam, u_post_rays, u_post_shadow_k, u_post_zoom;
+             u_post_color, u_post_beam, u_post_rays, u_post_shadow_k, u_post_zoom,
+             u_post_center, u_post_size;
 static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
 static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
-static GLint a_shadow, u_shadow_scene, u_shadow_res, u_shadow_m;
+static GLint a_shadow, u_shadow_scene, u_shadow_res, u_shadow_m,
+             u_shadow_center, u_shadow_size;
 
 #define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
 #define GL_FRAMEBUFFER_BINDING 0x8CA6
@@ -430,16 +432,16 @@ static const char *FS_POST =
     "  vec3 scene = texture2D(uScene, uv).rgb;\n"
     "  vec2 d = (uv - uSun) * vec2(uRes.x / uRes.y, 1.0);\n"
     "  float r = length(d);\n"
-    "  float fall = exp(-r * r * 2.5);\n"
-    "  float streak = 0.0;\n"
+    "  float fade = max(0.0, 1.0 - r / 1.15);\n"
+    "  float fall = fade * fade;\n"
+    "  float shade = 0.0;\n"
     "  for (int i = 0; i < 30; ++i) {\n"
     "    float k = 1.0 + float(i) * uZoom;\n"
     "    vec2 p = uSun + (uv - uSun) / k;\n"
-    "    streak += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
+    "    shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
     "  }\n"
-    "  streak *= 0.055 * uShadowK * uRays;\n"
-    "  vec3 light = uColor * fall * uBeam;\n"
-    "  light = max(light - vec3(streak), 0.0);\n"
+    "  shade = clamp(shade * 0.09 * uShadowK * uRays, 0.0, 1.0);\n"
+    "  vec3 light = uColor * fall * uBeam * (1.0 - 0.85 * shade);\n"
     "  gl_FragColor = vec4(scene + light, 1.0);\n"
     "}\n";
 
@@ -510,11 +512,15 @@ static bool gl_build(void) {
     u_post_rays     = glGetUniformLocation(g_prog_post, "uRays");
     u_post_shadow_k = glGetUniformLocation(g_prog_post, "uShadowK");
     u_post_zoom     = glGetUniformLocation(g_prog_post, "uZoom");
+    u_post_center   = glGetUniformLocation(g_prog_post, "uCenter");
+    u_post_size     = glGetUniformLocation(g_prog_post, "uSize");
 
     a_shadow      = glGetAttribLocation(g_prog_shadow, "aPos");
     u_shadow_scene = glGetUniformLocation(g_prog_shadow, "uScene");
     u_shadow_res   = glGetUniformLocation(g_prog_shadow, "uRes");
     u_shadow_m     = glGetUniformLocation(g_prog_shadow, "uM");
+    u_shadow_center = glGetUniformLocation(g_prog_shadow, "uCenter");
+    u_shadow_size   = glGetUniformLocation(g_prog_shadow, "uSize");
 
     a_tint = glGetAttribLocation(g_prog_tint, "aPos");
     u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
@@ -645,7 +651,11 @@ static void gl_render(const light_snap_t *s) {
     if (W <= 0 || H <= 0) return;
 
     static int first = 1;
-    if (first) { first = 0; LOG_INFO("首次交换绘制：视口=%dx%d", W, H); }
+    if (first) {
+        first = 0;
+        LOG_INFO("首次交换绘制：视口=%dx%d 光束=%.2f 太阳=(%.3f,%.3f) 色=(%.2f,%.2f,%.2f)",
+                 W, H, s->glowA, s->sunU, s->sunV, s->warmR, s->warmG, s->warmB);
+    }
 
     GLint pProg = 0, pTex = 0, pAct = 0, pVao = 0, pBuf = 0, pFbo = 0;
     GLint pBlend = 0, pDepth = 0, pCull = 0, pScissor = 0;
@@ -695,7 +705,7 @@ static void gl_render(const light_snap_t *s) {
             p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
             glViewport(0, 0, sw, sh);
             glDisable(GL_BLEND);
-            bind_quad(g_prog_shadow, a_shadow, -1, -1, 1.f, 1.f);
+            bind_quad(g_prog_shadow, a_shadow, u_shadow_center, u_shadow_size, 1.f, 1.f);
             glUniform2f(u_shadow_res, (float)sw, (float)sh);
             glUniform1f(u_shadow_m, s->shadowM);
             glUniform1i(u_shadow_scene, 0);
@@ -707,7 +717,7 @@ static void gl_render(const light_snap_t *s) {
 
         /* —— 合成：光晕 − 条纹，additive 叠回 —— */
         glDisable(GL_BLEND);
-        bind_quad(g_prog_post, a_post, -1, -1, 1.f, 1.f);
+        bind_quad(g_prog_post, a_post, u_post_center, u_post_size, 1.f, 1.f);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_tex);
         glUniform1i(u_post_scene, 0);
@@ -888,7 +898,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 9,
+    .version_code = 10,
     .api_version = 1,
     .version = MOD_VERSION,
 };
