@@ -48,7 +48,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.6.1-light"
+#define MOD_VERSION "2.6.2-light"
 
 /* ============================================================================
  * 配置
@@ -414,44 +414,25 @@ static void compute_light(light_snap_t *s) {
     float intensity = day ? (0.35f + DAY_GAIN * lift)
                           : (0.30f + NIGHT_GAIN * lift) * moonK;
 
-    /* 光色：按一天里的时刻插值（黎明淡紫 → 正午暖黄 → 黄昏橙红），夜里冷蓝 */
-    if (day) {
-        if (t01 < 0.5f) {
-            float u = t01 * 2.0f;
-            s->warmR = 0.73f + 0.13f * u;
-            s->warmG = 0.54f + 0.22f * u;
-            s->warmB = 0.58f - 0.06f * u;
-        } else {
-            float u = (t01 - 0.5f) * 2.0f;
-            s->warmR = 0.86f - 0.14f * u;
-            s->warmG = 0.76f - 0.46f * u;
-            s->warmB = 0.52f - 0.14f * u;
-        }
-    } else {
-        float w = (1.0f - moonK) * 0.5f;
-        s->warmR = 0.42f + 0.24f * w;
-        s->warmG = 0.52f + 0.16f * w;
-        s->warmB = 0.92f;
-    }
-    /* 光色：黄光走浓重的暖黄（正午偏金黄），白光固定为略偏冷的中性白 */
+    /* 光色：黄光走暖黄（正午偏金黄），白光固定为略偏冷的中性白 */
     if (day) {
         if (t01 < 0.5f) {
             float u = t01 * 2.0f;
             s->warmR = 0.95f + 0.05f * u;
-            s->warmG = 0.58f + 0.26f * u;
-            s->warmB = 0.24f + 0.14f * u;
+            s->warmG = 0.64f + 0.23f * u;
+            s->warmB = 0.32f + 0.14f * u;
         } else {
             float u = (t01 - 0.5f) * 2.0f;
             s->warmR = 1.00f;
-            s->warmG = 0.84f - 0.32f * u;
-            s->warmB = 0.38f - 0.22f * u;
+            s->warmG = 0.87f - 0.28f * u;
+            s->warmB = 0.46f - 0.26f * u;
         }
     } else {
         /* 黄光模式下的月光也保留一点暖琥珀色，不偏蓝 */
         float w = (1.0f - moonK) * 0.5f;
-        s->warmR = 0.72f + 0.10f * w;
-        s->warmG = 0.64f + 0.06f * w;
-        s->warmB = 0.42f - 0.04f * w;
+        s->warmR = 0.78f + 0.08f * w;
+        s->warmG = 0.70f + 0.05f * w;
+        s->warmB = 0.50f - 0.04f * w;
     }
     if (g_light_color == 1) {
         s->warmR = 0.96f;
@@ -462,10 +443,10 @@ static void compute_light(light_snap_t *s) {
         s->gradeG = 0.995f;
         s->gradeB = 1.03f;
     } else {
-        /* 整屏也压一点蓝，黄光才够“重” */
-        s->gradeR = day ? 1.06f : 1.03f;
-        s->gradeG = day ? 0.975f : 1.00f;
-        s->gradeB = day ? 0.72f : 0.86f;
+        /* 整屏色温只压一点点蓝，避免像老旧电视 */
+        s->gradeR = day ? 1.035f : 1.02f;
+        s->gradeG = day ? 0.985f : 0.995f;
+        s->gradeB = day ? 0.84f : 0.93f;
     }
 
     s->glowA = intensity * g_cfg_glow;
@@ -1224,7 +1205,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 13,
+    .version_code = 14,
     .api_version = 1,
     .version = MOD_VERSION,
 };
