@@ -18,7 +18,7 @@
       "x86": false
     },
     "linux": {
-      "x64": true,
+      "x64": false,
       "x86": false
     },
     "mac": {

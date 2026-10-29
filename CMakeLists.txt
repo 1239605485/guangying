@@ -3,32 +3,18 @@ project(LightsAndShadows)
 
 set(CMAKE_C_STANDARD 11)
 
-# 手机端：EGL / GLESv2，eglSwapBuffers 钩子。
-# PC 端：桌面 OpenGL + GraphicsDevice.Present 钩子，单独编译 main_pc.c。
-if(ANDROID)
-    # xDL（MIT，© 2020-2025 HexHacking Team）：Android 符号查找回退。
-    add_subdirectory(xdl)
-    set_target_properties(xdl PROPERTIES C_VISIBILITY_PRESET hidden)
+# xDL（MIT，© 2020-2025 HexHacking Team）：Android 符号查找回退。
+# 当前 GL 技术线已不建 Unity 贴图（不需要 il2cpp_gchandle_new），保留 xdl 只是
+# 为以后可能要用 il2cpp 符号留的口子；不引用任何符号时静态库不会拉进产物。
+add_subdirectory(xdl)
+set_target_properties(xdl PROPERTIES C_VISIBILITY_PRESET hidden)
 
-    add_library(LightsAndShadows SHARED
-            main.c
-            tefkernel/tef_api_imp.c
-    )
-    target_include_directories(LightsAndShadows PRIVATE xdl/include)
-    target_link_directories(LightsAndShadows PUBLIC ./mod-api ./tefkernel)
-    target_link_libraries(LightsAndShadows xdl m dl log EGL GLESv2)
-else()
-    # main_pc.c 目前是桌面 OpenGL（FNA）后端。
-    # Windows 原版走 XNA/D3D9，不能直接复用这套 GL 着色器。
-    if(WIN32)
-        message(FATAL_ERROR "main_pc.c 目前只支持 Linux/macOS 的 OpenGL 后端；Windows XNA/D3D9 需要单独的渲染实现")
-    endif()
-    add_library(LightsAndShadows SHARED
-            main_pc.c
-            tefkernel/tef_api_imp.c
-    )
-    set_target_properties(LightsAndShadows PROPERTIES
-            OUTPUT_NAME "LightsAndShadows.linux.x64")
-    target_link_directories(LightsAndShadows PUBLIC ./mod-api ./tefkernel)
-    target_link_libraries(LightsAndShadows m dl GL)
-endif()
+# EGL / GLESv2：GL 后处理（eglSwapBuffers 钩子 + 自己的着色器）。
+# 必须真的链上，否则产物没有 DT_NEEDED，dlopen 时找不到 eglSwapBuffers。
+add_library(LightsAndShadows SHARED
+        main.c
+        tefkernel/tef_api_imp.c
+)
+target_include_directories(LightsAndShadows PRIVATE xdl/include)
+target_link_directories(LightsAndShadows PUBLIC ./mod-api ./tefkernel)
+target_link_libraries(LightsAndShadows xdl m dl log EGL GLESv2)
