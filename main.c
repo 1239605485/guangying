@@ -8,18 +8,17 @@
 // ---------------------------------------------------------------------------
 // v2.4：仿原版的「光 − 阴影」屏幕后处理（感谢 yiyang233 大佬的思路）
 // ---------------------------------------------------------------------------
-//   绘制在 Main.DrawInterface 的 prefix（世界画完、UI 还没开始）用原生 GL 做后处理：
+//   绘制走原生 GL 屏幕后处理（eglSwapBuffers 钩子，在交换之前画）：
 //     · 光：以太阳位置为中心的宽光晕（加色），颜色随一天时刻变化
 //     · 阴影：本帧缩到 1/3，按蓝色通道提取遮挡（树/地面蓝少 → 阴影强）
 //     · 光柱：阴影沿太阳方向逐层放大叠加成条纹，「光 − 阴影」漏出丁达尔光柱
-//   效果只作用于世界，之后绘制的血条、Buff 栏、物品栏等 UI 都不会被盖住。
-//   如果 DrawInterface 钩子装不上，才退回到 eglSwapBuffers（会盖住 UI）。
+//   光按 additive 叠回场景，不破坏 alpha。
 //
 //   太阳位置直接取游戏自己算好的 Main.LastCelestialBodyPosition，和天上那颗太阳对齐；
 //   读不到才退回自己的圆弧（且不画亮核，避免出现第二颗太阳）。
 //
 //   状态由 Main.DrawInterface_36_Cursor 的 postfix 读出来写进快照（游戏线程），
-//   界面绘制前只读快照 —— 避免跨线程读游戏数据。
+//   渲染线程只读快照 —— 避免跨线程读游戏数据。
 //
 // 读属性的坑：稳定内核的 FFI 对**结构体返回**(Vector2) 有 bug（invoke 返回成功但不写缓冲）。
 // 这里所有 0 参 getter 一律走 patchlib_method_get_pointer **原生直调**，绕开内核 FFI。
@@ -49,7 +48,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.7.0-light"
+#define MOD_VERSION "2.6.3-light"
 
 /* ============================================================================
  * 配置
@@ -1150,23 +1149,7 @@ static void uninstall_swap_hook(void) {
  * ========================================================================== */
 
 static patch_hook_id_t g_hook_draw = PATCH_HOOK_INVALID_ID;
-static patch_hook_id_t g_hook_interface = PATCH_HOOK_INVALID_ID;
-static volatile int g_in_interface;
 static bool g_logged_splash;
-
-/* 世界已画完、UI 还没开始：在这里做后处理，UI 随后画在效果上面。
- * 比 eglSwapBuffers 晚画的好处是不会把血条/Buff/物品栏一起染色。 */
-static bool on_interface(patch_handle_t instance, void **args,
-                         const patch_method_signature_t *sig, void *result) {
-    (void)instance; (void)args; (void)sig; (void)result;
-    if (!g_enabled) return false;
-    if (g_in_interface) return false;
-    g_in_interface = 1;
-    int i = g_snap_head;
-    if (i >= 0) gl_render(&g_snap[i]);
-    g_in_interface = 0;
-    return false;
-}
 
 static void on_draw(patch_handle_t instance, void **args, void *result,
                     const patch_method_signature_t *sig) {
@@ -1222,7 +1205,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 16,
+    .version_code = 15,
     .api_version = 1,
     .version = MOD_VERSION,
 };
@@ -1243,18 +1226,7 @@ static void init_mod(kernel_mod_handle_t *handle) {
     g_hook_draw = patchlib_install_prepost_hook(draw_method, NULL, on_draw);
     if (g_hook_draw == PATCH_HOOK_INVALID_ID) { LOG_ERROR("快照钩子安装失败"); return; }
 
-    /* 首选：Main.DrawInterface 之前画，世界有、UI 还没有 */
-    patch_handle_t iface =
-        patchlib_type_get_method_by_param_count(g_main_type, "DrawInterface", 1);
-    if (patchlib_is_valid(iface)) {
-        g_hook_interface = patchlib_install_prepost_hook(iface, on_interface, NULL);
-    }
-    if (g_hook_interface == PATCH_HOOK_INVALID_ID) {
-        LOG_ERROR("Main.DrawInterface 钩子不可用，退回 eglSwapBuffers（会盖住 UI）");
-        if (!install_swap_hook()) LOG_ERROR("eglSwapBuffers 钩子安装失败");
-    } else {
-        LOG_INFO("界面绘制钩子就绪：后处理只作用于世界，不覆盖 UI");
-    }
+    if (!install_swap_hook()) LOG_ERROR("eglSwapBuffers 钩子安装失败");
 
     read_config_json();
     read_settings_txt();
@@ -1262,17 +1234,13 @@ static void init_mod(kernel_mod_handle_t *handle) {
              quality_name(g_quality), g_taps, g_shadow_div, g_cfg_shadow,
              g_light_color ? "白光" : "黄光", g_cfg_glow, g_cfg_rays,
              g_enabled ? "" : " — 已关闭，不绘制");
-    LOG_INFO("初始化完成 v%s（快照 hook=%d 界面 hook=%d swap=%d）", MOD_VERSION,
-             (int)g_hook_draw, (int)g_hook_interface, g_hook_installed ? 1 : 0);
+    LOG_INFO("初始化完成 v%s（快照 hook=%d swap=%d）", MOD_VERSION, (int)g_hook_draw,
+             g_hook_installed ? 1 : 0);
 }
 
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;
     uninstall_swap_hook();
-    if (g_hook_interface != PATCH_HOOK_INVALID_ID) {
-        patchlib_uninstall_hook(g_hook_interface);
-        g_hook_interface = PATCH_HOOK_INVALID_ID;
-    }
     if (g_hook_draw != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(g_hook_draw);
         g_hook_draw = PATCH_HOOK_INVALID_ID;
