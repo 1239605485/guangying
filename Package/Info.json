@@ -14,8 +14,8 @@
       "arm": false
     },
     "windows": {
-      "x64": true,
-      "x86": true
+      "x64": false,
+      "x86": false
     },
     "linux": {
       "x64": true,
