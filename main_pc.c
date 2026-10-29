@@ -9,13 +9,10 @@
 //     · 以太阳为中心的宽光晕 + 光柱 additive 叠回，再乘黄/白色温
 //
 // PC 走桌面 OpenGL（FNA 后端）：
-//   · 不链接 EGL/GLESv2，使用 libGL + GLSL 120
-//   · 用 patchlib 挂 Microsoft.Xna.Framework.Graphics.GraphicsDevice.Present
-//     的 prefix，在 Present/交换之前画，GL 上下文在游戏线程上
+//   · 不依赖 GL/D3D：GetBackBufferData 读回场景，CPU 处理后用
+//     Texture2D + SpriteBatch 画回，Windows/Linux 的 XNA/FNA 都能用
+//   · 用 patchlib 挂 Main.DrawInterface 的 prefix，在世界画完、UI 开始前绘制
 //   · 太阳/时间等状态仍由 Main.DrawInterface_36_Cursor 的 postfix 写快照
-//
-// 注意：这是 PC 的 FNA/OpenGL 后端。Windows 原版 XNA/D3D9 不走 GL，
-// 需要另写 D3D9 后端，不能直接用本文件。
 //
 
 #include "mod-api/mod_core.h"
@@ -23,14 +20,11 @@
 #include "tefkernel/patchlib/type.h"
 #include "tefkernel/patchlib/method.h"
 #include "tefkernel/patchlib/field.h"
+#include "tefkernel/patchlib/struct/array.h"
+#include "tefkernel/tefstd/vector.h"
+#include "tefkernel/terraria/main.h"
+#include "tefkernel/terraria/texture2d.h"
 
-#ifndef GL_GLEXT_PROTOTYPES
-#define GL_GLEXT_PROTOTYPES 1
-#endif
-#include <GL/gl.h>
-#include <GL/glext.h>
-
-#include <dlfcn.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -472,684 +466,411 @@ static void compute_light(light_snap_t *s) {
     }
 }
 
+
 /* ============================================================================
- * 四、GL 层：仿原版「光 − 阴影」的屏幕后处理
+ * 五、PC：XNA API 屏幕后处理
  *
- *   1) 把本帧读成场景纹理（MSAA 用 glBlitFramebuffer 解析；不行再 glCopyTexSubImage2D）
- *   2) 场景缩到 1/3 分辨率，按蓝色通道取阴影：蓝越小阴影越强（天空是蓝的 → 不算阴影）
- *   3) 阴影沿太阳方向逐层放大叠加成条纹；以太阳为中心的宽光晕减掉条纹，
- *      再 additive 叠回场景 —— 树缝里就漏出光柱
+ * 不再依赖 OpenGL/D3D 后端：
+ *   1. Main.DrawInterface 的 prefix（世界画完、UI 还没开始）用
+ *      GraphicsDevice.GetBackBufferData 把场景读回 CPU
+ *   2. CPU 在低分辨率下提阴影/走光柱，再按完整分辨率做色温和叠光
+ *   3. 用 Texture2D + SpriteBatch 把结果画回屏幕，UI 随后正常覆盖
  *
- *   读不了场景的设备回退纯叠加（光晕加色 + 色罩乘法），屏幕永远不会黑。
- *   g_mode: 0=未探测  1=后处理  2=纯叠加
+ * PC 性能足够，CPU 版本避免 GL/D3D 上下文和着色器兼容问题。
  * ========================================================================== */
 
-static const float QUAD[8] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f };
+static int g_pc_state;              /* 0=未初始化 1=可用 -1=失败 */
+static patch_handle_t g_pc_gd;
+static patch_handle_t g_pc_color_type, g_pc_uint8_type;
+static patch_handle_t g_pc_gd_type, g_pc_tex_type, g_pc_sb_type;
+static patch_handle_t g_pc_m_backbuffer, g_pc_m_setdata, g_pc_m_draw;
+static patch_handle_t g_pc_m_sb_begin, g_pc_m_sb_end, g_pc_m_viewport;
+static patch_handle_t g_pc_sb_field, g_pc_gch_type, g_pc_m_gch_alloc;
 
-static int g_gl_state;
-static int g_mode;
-static int g_use_blit;
-static GLuint g_vbo;
-static GLuint g_prog_tint, g_prog_glow, g_prog_shadow, g_prog_composite;
-static GLuint g_scene_tex, g_shadow_tex, g_light_tex;
-static GLuint g_fbo_scene, g_fbo_shadow, g_fbo_light;
-static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h, g_light_w, g_light_h;
+static patch_handle_t g_pc_tex, g_pc_tex_array;
+static void *g_pc_tex_pin, *g_pc_arr_pin;
+static int g_pc_w, g_pc_h;          /* CPU 缓冲尺寸 */
+static int g_pc_tex_w, g_pc_tex_h;  /* 纹理尺寸（缩放后要重建） */
+static unsigned char *g_pc_scene, *g_pc_out;
+static float *g_pc_blue, *g_pc_shadow, *g_pc_light;
 
-/* 光柱采样数是着色器里的循环上界，必须编译期常量；
- * 所以每档采样数各编译一份，只在用到的档位编一次（一局只编一份）。 */
-typedef struct {
-    GLuint prog;
-    GLint  apos, center, size, shadow, res, sun, color, beam, rays, shadow_k,
-           shadow_strength, zoom;
-    int    taps;
-    int    state;                 /* 0=未编译 1=可用 -1=失败 */
-} post_variant_t;
-static post_variant_t g_post_variant;
-static GLint a_tint, u_tint_center, u_tint_size, u_tint_res, u_tint_top, u_tint_bottom, u_tint_vignette;
-static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
-             u_glow_color, u_glow_strength;
-static GLint a_shadow, u_shadow_scene, u_shadow_res, u_shadow_m,
-             u_shadow_center, u_shadow_size;
-static GLint a_composite, u_composite_scene, u_composite_light, u_composite_grade,
-             u_composite_center, u_composite_size;
-
-#define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
-#define GL_FRAMEBUFFER_BINDING 0x8CA6
-#define GL_FRAMEBUFFER         0x8D40
-#define GL_COLOR_ATTACHMENT0   0x8CE0
-#define GL_READ_FRAMEBUFFER    0x8CA8
-#define GL_DRAW_FRAMEBUFFER    0x8CA9
-#define GL_COLOR_BUFFER_BIT    0x00004000
-
-typedef void (*PFN_bindvao)(GLuint);
-typedef void (*PFN_genfb)(GLsizei, GLuint *);
-typedef void (*PFN_bindfb)(GLenum, GLuint);
-typedef void (*PFN_fbtex)(GLenum, GLenum, GLenum, GLuint, GLint);
-typedef void (*PFN_blit)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
-
-static PFN_bindvao p_bind_vao;
-static PFN_genfb   p_gen_fb;
-static PFN_bindfb  p_bind_fb;
-static PFN_fbtex   p_fb_tex;
-static PFN_blit    p_blit;
-
-static void *gl_proc(const char *name) {
-    void *p = (void *)dlsym(RTLD_DEFAULT, name);
-    return p;
+static patch_handle_t pc_generic_one(patch_handle_t method, patch_handle_t type) {
+    if (!patchlib_is_valid(method) || !patchlib_is_valid(type)) return PATCH_NULL;
+    tefstd_vector_t types;
+    tefstd_vector_init(&types, sizeof(patch_handle_t));
+    tefstd_vector_push_back(&types, &type);
+    patch_handle_t out = patchlib_method_make_generic_instance(method, &types);
+    tefstd_vector_destroy(&types);
+    return out;
 }
 
-static void *proc(const char *a, const char *b) {
-    void *p = gl_proc(a);
-    if (!p) p = gl_proc(b);
-    return p;
+static void *pc_pin(patch_handle_t obj) {
+    if (!patchlib_is_valid(g_pc_m_gch_alloc) || !patchlib_is_valid(obj)) return NULL;
+    void *pin = NULL;
+    void *args[1] = { &obj };
+    if (!patchlib_method_invoke_args(g_pc_m_gch_alloc, PATCH_NULL, &pin, args)) return NULL;
+    return pin;
 }
 
-/* 桌面 GL 用 GLSL 120；不能带 GLES 的 precision 限定符 */
-#define GLSL_HEADER "#version 120\n"
-#define PRECISION GLSL_HEADER ""
+static bool pc_init_xna(void) {
+    if (g_pc_state != 0) return g_pc_state > 0;
+    g_pc_state = -1;
 
-static const char *VS_SRC =
-    GLSL_HEADER
-    "attribute vec2 aPos;\n"
-    "varying vec2 vUV;\n"
-    "uniform vec2 uCenter;\n"
-    "uniform vec2 uSize;\n"
-    "void main(){\n"
-    "  vUV = aPos * 0.5 + 0.5;\n"
-    "  gl_Position = vec4(uCenter + aPos * uSize, 0.0, 1.0);\n"
-    "}\n";
-
-/* —— 回退路径用：整屏色罩（乘法） —— */
-static const char *FS_TINT =
-    PRECISION
-    "uniform vec2 uRes;\n"
-    "uniform vec3 uTop;\n"
-    "uniform vec3 uBottom;\n"
-    "uniform float uVignette;\n"
-    "void main(){\n"
-    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  vec3 c = mix(uBottom, uTop, clamp(uv.y, 0.0, 1.0));\n"
-    "  vec2 q = uv - 0.5;\n"
-    "  float vig = 1.0 - uVignette * dot(q, q) * 3.0;\n"
-    "  c *= clamp(vig, 0.0, 1.0);\n"
-    "  gl_FragColor = vec4(c, 1.0);\n"
-    "}\n";
-
-/* —— 回退路径用：太阳光晕（加色，不读帧缓冲） —— */
-static const char *FS_GLOW =
-    PRECISION
-    "uniform vec2 uRes;\n"
-    "uniform vec2 uSun;\n"
-    "uniform vec3 uColor;\n"
-    "uniform float uStrength;\n"
-    "void main(){\n"
-    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  vec2 d = uv - uSun;\n"
-    "  d.x *= uRes.x / uRes.y;\n"
-    "  float r = length(d);\n"
-    "  float fall = max(0.0, (3.0 - r) / 3.0);\n"
-    "  gl_FragColor = vec4(uColor * fall * fall * uStrength, 1.0);\n"
-    "}\n";
-
-/* —— 阴影提取（降采样）：先做 3x3 模糊软化图格边缘，再按蓝通道取阴影 —— */
-static const char *FS_SHADOW =
-    PRECISION
-    "uniform sampler2D uScene;\n"
-    "uniform vec2 uRes;\n"
-    "uniform float uM;\n"
-    "void main(){\n"
-    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  vec2 t = 1.5 / uRes;\n"
-    "  float b = 0.0;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( 0.0, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x,  0.0)).b;\n"
-    "  b += texture2D(uScene, uv).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x,  0.0)).b;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x,  t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( 0.0,  t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x,  t.y)).b;\n"
-    "  b /= 9.0;\n"
-    "  float s = pow(max(1.0 - b, 0.0), 0.75);\n"
-    "  s *= 1.0 - smoothstep(uM * 0.72, uM, b);\n"
-    "  gl_FragColor = vec4(s, s, s, 1.0);\n"
-    "}\n";
-
-/* —— 光照/光柱：在半分辨率下累加阴影，输出纯光色（不读场景） —— */
-static const char *FS_LIGHT =
-    PRECISION
-    "uniform sampler2D uShadow;\n"
-    "uniform vec2 uRes;\n"
-    "uniform vec2 uSun;\n"
-    "uniform vec3 uColor;\n"
-    "uniform float uBeam;\n"
-    "uniform float uRays;\n"
-    "uniform float uShadowK;\n"
-    "uniform float uShadowStrength;\n"
-    "uniform float uZoom;\n"
-    "void main(){\n"
-    "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  vec2 d = (uv - uSun) * vec2(uRes.x / uRes.y, 1.0);\n"
-    "  float r = length(d);\n"
-    "  float fade = max(0.0, 1.0 - r / 1.15);\n"
-    "  float fall = fade * fade;\n"
-    "  float shade = 0.0;\n"
-    "  for (int i = 0; i < RAY_TAPS; ++i) {\n"
-    "    float k = 1.0 + float(i) * uZoom;\n"
-    "    vec2 p = uSun + (uv - uSun) / k;\n"
-    "    shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
-    "  }\n"
-    "  shade = clamp(shade * 0.09 * uShadowK * uRays * uShadowStrength, 0.0, 1.0);\n"
-    "  float lit = max(0.0, 1.0 - 0.96 * shade);\n"
-    "  gl_FragColor = vec4(uColor * fall * uBeam * lit, 1.0);\n"
-    "}\n";
-
-/* —— 把降采样的光照图叠回场景，并做黄光/白光的整屏色温 —— */
-static const char *FS_COMPOSITE =
-    PRECISION
-    "uniform sampler2D uScene;\n"
-    "uniform sampler2D uLight;\n"
-    "uniform vec3 uGrade;\n"
-    "varying vec2 vUV;\n"
-    "void main(){\n"
-    "  vec3 scene = texture2D(uScene, vUV).rgb * uGrade;\n"
-    "  gl_FragColor = vec4(scene + texture2D(uLight, vUV).rgb, 1.0);\n"
-    "}\n";
-
-static GLuint compile_shader(GLenum type, const char *src, const char *tag) {
-    GLuint sh = glCreateShader(type);
-    if (!sh) return 0;
-    glShaderSource(sh, 1, &src, NULL);
-    glCompileShader(sh);
-    GLint ok = 0;
-    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        GLsizei n = 0;
-        glGetShaderInfoLog(sh, sizeof(log) - 1, &n, log);
-        log[n < 0 ? 0 : n] = 0;
-        LOG_ERROR("着色器编译失败 %s: %s", tag, log);
-        glDeleteShader(sh);
-        return 0;
-    }
-    return sh;
-}
-
-static GLuint build_program(const char *fsrc, const char *tag) {
-    GLuint vs = compile_shader(GL_VERTEX_SHADER, VS_SRC, "VS");
-    if (!vs) return 0;
-    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fsrc, tag);
-    if (!fs) { glDeleteShader(vs); return 0; }
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    GLint ok = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        GLsizei n = 0;
-        glGetProgramInfoLog(prog, sizeof(log) - 1, &n, log);
-        log[n < 0 ? 0 : n] = 0;
-        LOG_ERROR("程序链接失败 %s: %s", tag, log);
-        glDeleteProgram(prog);
-        return 0;
-    }
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    return prog;
-}
-
-static int post_build(post_variant_t *v, int taps) {
-    char hdr[48];
-    snprintf(hdr, sizeof(hdr), "#define RAY_TAPS %d\n", taps);
-
-    GLuint vs = compile_shader(GL_VERTEX_SHADER, VS_SRC, "VS");
-    if (!vs) return -1;
-    char src[8192];
-    int n = snprintf(src, sizeof(src), "%s%s", hdr, FS_LIGHT);
-    if (n <= 0 || (size_t)n >= sizeof(src)) { glDeleteShader(vs); return -1; }
-    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, src, "光-阴影");
-    if (!fs) { glDeleteShader(vs); return -1; }
-
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    GLint ok = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[512];
-        GLsizei ln = 0;
-        glGetProgramInfoLog(prog, sizeof(log) - 1, &ln, log);
-        log[ln < 0 ? 0 : ln] = 0;
-        LOG_ERROR("程序链接失败 光-阴影: %s", log);
-        glDeleteProgram(prog);
-        glDeleteShader(vs);
-        glDeleteShader(fs);
-        return -1;
-    }
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    memset(v, 0, sizeof(*v));
-    v->prog      = prog;
-    v->taps      = taps;
-    v->apos      = glGetAttribLocation(prog, "aPos");
-    v->shadow    = glGetUniformLocation(prog, "uShadow");
-    v->res       = glGetUniformLocation(prog, "uRes");
-    v->sun       = glGetUniformLocation(prog, "uSun");
-    v->color     = glGetUniformLocation(prog, "uColor");
-    v->beam      = glGetUniformLocation(prog, "uBeam");
-    v->rays      = glGetUniformLocation(prog, "uRays");
-    v->shadow_k  = glGetUniformLocation(prog, "uShadowK");
-    v->shadow_strength = glGetUniformLocation(prog, "uShadowStrength");
-    v->zoom      = glGetUniformLocation(prog, "uZoom");
-    v->center    = glGetUniformLocation(prog, "uCenter");
-    v->size      = glGetUniformLocation(prog, "uSize");
-    if (v->apos < 0) {
-        LOG_ERROR("后处理 aPos 无效（%d 采样）", taps);
-        glDeleteProgram(prog);
-        return -1;
-    }
-    LOG_INFO("后处理就绪：%d 采样", taps);
-    return 0;
-}
-
-static post_variant_t *post_get(int taps) {
-    if (g_post_variant.state == 0) {
-        g_post_variant.state = (post_build(&g_post_variant, taps) == 0) ? 1 : -1;
-    }
-    if (g_post_variant.state < 0) return NULL;
-    return &g_post_variant;
-}
-
-static bool gl_build(void) {
-    if (g_gl_state != 0) return g_gl_state > 0;
-
-    g_prog_shadow = build_program(FS_SHADOW, "阴影");
-    g_prog_tint   = build_program(FS_TINT,   "色罩");
-    g_prog_glow   = build_program(FS_GLOW,   "光晕");
-    g_prog_composite = build_program(FS_COMPOSITE, "合成");
-    if (!g_prog_shadow || !g_prog_tint || !g_prog_glow || !g_prog_composite) {
-        LOG_ERROR("GL 程序构建失败");
-        g_gl_state = -1;
+    g_pc_gd = terraria_main_get_graphics_device();
+    if (!patchlib_is_valid(g_pc_gd)) {
+        LOG_ERROR("PC: 取不到 GraphicsDevice");
         return false;
     }
 
-    a_shadow      = glGetAttribLocation(g_prog_shadow, "aPos");
-    u_shadow_scene = glGetUniformLocation(g_prog_shadow, "uScene");
-    u_shadow_res   = glGetUniformLocation(g_prog_shadow, "uRes");
-    u_shadow_m     = glGetUniformLocation(g_prog_shadow, "uM");
-    u_shadow_center = glGetUniformLocation(g_prog_shadow, "uCenter");
-    u_shadow_size   = glGetUniformLocation(g_prog_shadow, "uSize");
+    g_pc_gd_type = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics", "GraphicsDevice");
+    g_pc_tex_type = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics", "Texture2D");
+    g_pc_sb_type = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics", "SpriteBatch");
+    g_pc_color_type = patchlib_type_get_type("Microsoft.Xna.Framework", "Color");
+    g_pc_uint8_type = patchlib_get_basic_type(PATCH_UINT8);
+    if (!patchlib_is_valid(g_pc_color_type))
+        g_pc_color_type = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics", "Color");
 
-    a_composite = glGetAttribLocation(g_prog_composite, "aPos");
-    u_composite_scene = glGetUniformLocation(g_prog_composite, "uScene");
-    u_composite_light = glGetUniformLocation(g_prog_composite, "uLight");
-    u_composite_grade = glGetUniformLocation(g_prog_composite, "uGrade");
-    u_composite_center = glGetUniformLocation(g_prog_composite, "uCenter");
-    u_composite_size = glGetUniformLocation(g_prog_composite, "uSize");
+    patch_handle_t m_bb = patchlib_type_get_method_by_param_count(
+            g_pc_gd_type, "GetBackBufferData", 1);
+    patch_handle_t m_sd = patchlib_type_get_method_by_param_count(
+            g_pc_tex_type, "SetData", 1);
+    g_pc_m_backbuffer = pc_generic_one(m_bb, g_pc_color_type);
+    g_pc_m_setdata = pc_generic_one(m_sd, g_pc_uint8_type);
+    g_pc_m_sb_begin = patchlib_type_get_method_by_param_count(g_pc_sb_type, "Begin", 0);
+    g_pc_m_sb_end = patchlib_type_get_method_by_param_count(g_pc_sb_type, "End", 0);
+    g_pc_m_viewport = patchlib_type_get_method_by_param_count(g_pc_gd_type, "get_Viewport", 0);
 
-    a_tint = glGetAttribLocation(g_prog_tint, "aPos");
-    u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
-    u_tint_size = glGetUniformLocation(g_prog_tint, "uSize");
-    u_tint_res = glGetUniformLocation(g_prog_tint, "uRes");
-    u_tint_top = glGetUniformLocation(g_prog_tint, "uTop");
-    u_tint_bottom = glGetUniformLocation(g_prog_tint, "uBottom");
-    u_tint_vignette = glGetUniformLocation(g_prog_tint, "uVignette");
+    patch_handle_t t_rect = patchlib_type_get_type("Microsoft.Xna.Framework", "Rectangle");
+    patch_handle_t draw_types[3] = { g_pc_tex_type, t_rect, g_pc_color_type };
+    g_pc_m_draw = patchlib_type_get_method_by_param_types(g_pc_sb_type, "Draw", 3, draw_types);
 
-    a_glow = glGetAttribLocation(g_prog_glow, "aPos");
-    u_glow_center = glGetUniformLocation(g_prog_glow, "uCenter");
-    u_glow_size = glGetUniformLocation(g_prog_glow, "uSize");
-    u_glow_res = glGetUniformLocation(g_prog_glow, "uRes");
-    u_glow_sun = glGetUniformLocation(g_prog_glow, "uSun");
-    u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
-    u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
+    g_pc_sb_field = patchlib_type_get_field(g_main_type, "spriteBatch");
 
-    if (a_shadow < 0 || a_tint < 0 || a_glow < 0 || a_composite < 0) {
-        LOG_ERROR("aPos 无效");
-        g_gl_state = -1;
+    patch_handle_t t_gch = patchlib_type_get_type("System.Runtime.InteropServices", "GCHandle");
+    g_pc_m_gch_alloc = patchlib_type_get_method_by_param_count(t_gch, "Alloc", 1);
+
+    if (!patchlib_is_valid(g_pc_m_backbuffer) || !patchlib_is_valid(g_pc_m_sb_begin) ||
+        !patchlib_is_valid(g_pc_m_sb_end) || !patchlib_is_valid(g_pc_m_draw)) {
+        LOG_ERROR("PC: XNA 绘制 API 不完整（bb=%d begin=%d end=%d draw=%d）",
+                  patchlib_is_valid(g_pc_m_backbuffer),
+                  patchlib_is_valid(g_pc_m_sb_begin), patchlib_is_valid(g_pc_m_sb_end),
+                  patchlib_is_valid(g_pc_m_draw));
         return false;
     }
 
-    glGenBuffers(1, &g_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-    GLuint tex[3] = { 0, 0, 0 };
-    glGenTextures(3, tex);
-    g_scene_tex = tex[0];
-    g_shadow_tex = tex[1];
-    g_light_tex = tex[2];
-    for (int i = 0; i < 3; ++i) {
-        glBindTexture(GL_TEXTURE_2D, tex[i]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    p_bind_vao = (PFN_bindvao)proc("glBindVertexArrayOES", "glBindVertexArray");
-    p_gen_fb   = (PFN_genfb)  proc("glGenFramebuffers", "glGenFramebuffersOES");
-    p_bind_fb  = (PFN_bindfb) proc("glBindFramebuffer", "glBindFramebufferOES");
-    p_fb_tex   = (PFN_fbtex)  proc("glFramebufferTexture2D", "glFramebufferTexture2DOES");
-    p_blit     = (PFN_blit)   proc("glBlitFramebuffer", "glBlitFramebuffer");
-
-    g_fbo_scene = 0;
-    g_fbo_shadow = 0;
-    g_fbo_light = 0;
-    if (p_gen_fb && p_bind_fb && p_fb_tex) {
-        GLuint fb[3] = { 0, 0, 0 };
-        p_gen_fb(3, fb);
-        g_fbo_scene = fb[0];
-        g_fbo_shadow = fb[1];
-        g_fbo_light = fb[2];
-    }
-
-    g_gl_state = 1;
-    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u/%u/%u）", MOD_VERSION,
-             p_blit ? 1 : 0, g_fbo_scene, g_fbo_shadow, g_fbo_light);
+    g_pc_state = 1;
+    LOG_INFO("PC: XNA 屏幕后处理就绪（GetBackBufferData + Texture2D + SpriteBatch）");
     return true;
 }
 
-/* 把默认帧缓冲读进场景纹理；1=成功 */
-static int fill_scene(int W, int H) {
-    glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-    if (g_scene_w != W || g_scene_h != H) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        g_scene_w = W;
-        g_scene_h = H;
-        if (p_bind_fb && g_fbo_scene) {
-            p_bind_fb(GL_FRAMEBUFFER, g_fbo_scene);
-            p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_scene_tex, 0);
-            p_bind_fb(GL_FRAMEBUFFER, 0);
-        }
+static bool pc_resize(int W, int H) {
+    if (W <= 0 || H <= 0) return false;
+    if (g_pc_scene && g_pc_w == W && g_pc_h == H) return true;
+
+    unsigned char *scene = (unsigned char *) realloc(g_pc_scene, (size_t) W * H * 4);
+    unsigned char *out = (unsigned char *) realloc(g_pc_out, (size_t) W * H * 4);
+    if (!scene || !out) {
+        free(scene); free(out);
+        return false;
     }
-
-    glGetError();
-    if (g_use_blit && p_blit && g_fbo_scene) {
-        p_bind_fb(GL_READ_FRAMEBUFFER, 0);
-        p_bind_fb(GL_DRAW_FRAMEBUFFER, g_fbo_scene);
-        p_blit(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        p_bind_fb(GL_FRAMEBUFFER, 0);
-        if (glGetError() == GL_NO_ERROR) return 1;
-        glGetError();
-        g_use_blit = 0;
-    }
-
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, W, H);
-    if (glGetError() == GL_NO_ERROR) return 1;
-    return 0;
-}
-
-/* 探测：MSAA 解析 → 直接拷贝 → 纯叠加 */
-static int gl_probe_mode(int W, int H) {
-    if (p_blit && g_fbo_scene) {
-        g_use_blit = 1;
-        if (fill_scene(W, H)) {
-            LOG_INFO("MSAA 解析成功，启用体积光");
-            return 1;
-        }
-        LOG_INFO("MSAA 解析失败，改试直接拷贝");
-    }
-    g_use_blit = 0;
-    if (fill_scene(W, H)) {
-        LOG_INFO("场景拷贝成功，启用体积光");
-        return 1;
-    }
-    LOG_ERROR("读场景失败，回退到纯叠加");
-    return 2;
-}
-
-static void bind_quad(GLuint prog, GLint apos, GLint ucen, GLint usz, float hw, float hh) {
-    glUseProgram(prog);
-    if (ucen >= 0) glUniform2f(ucen, 0.f, 0.f);
-    if (usz >= 0) glUniform2f(usz, hw, hh);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glEnableVertexAttribArray((GLuint)apos);
-    glVertexAttribPointer((GLuint)apos, 2, GL_FLOAT, GL_FALSE, 0, 0);
-}
-
-static void gl_render(const light_snap_t *s) {
-    if (!s->enabled) return;
-    if (!gl_build()) return;
-
-    GLint vp[4] = { 0, 0, 0, 0 };
-    glGetIntegerv(GL_VIEWPORT, vp);
-    GLint W = vp[2], H = vp[3];
-    if (W <= 0 || H <= 0) return;
-
-    static int first = 1;
-    if (first) {
-        first = 0;
-        LOG_INFO("首次交换绘制：视口=%dx%d 光束=%.2f 太阳=(%.3f,%.3f) 色=(%.2f,%.2f,%.2f)",
-                 W, H, s->glowA, s->sunU, s->sunV, s->warmR, s->warmG, s->warmB);
-    }
-
-    GLint pProg = 0, pTex = 0, pAct = 0, pVao = 0, pBuf = 0, pFbo = 0;
-    GLint pBlend = 0, pDepth = 0, pCull = 0, pScissor = 0;
-    GLint pSrcRGB = 0, pDstRGB = 0, pEqRGB = 0, pSrcA = 0, pDstA = 0, pEqA = 0;
-    GLint pVp[4] = { 0, 0, 0, 0 };
-    glGetIntegerv(GL_CURRENT_PROGRAM, &pProg);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &pTex);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &pAct);
-    if (p_bind_vao) glGetIntegerv(GL_VERTEX_ARRAY_BINDING_OES, &pVao);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &pBuf);
-    if (p_bind_fb) glGetIntegerv(GL_FRAMEBUFFER_BINDING, &pFbo);
-    glGetIntegerv(GL_BLEND, &pBlend);
-    glGetIntegerv(GL_DEPTH_TEST, &pDepth);
-    glGetIntegerv(GL_CULL_FACE, &pCull);
-    glGetIntegerv(GL_SCISSOR_TEST, &pScissor);
-    glGetIntegerv(GL_BLEND_SRC_RGB, &pSrcRGB);
-    glGetIntegerv(GL_BLEND_DST_RGB, &pDstRGB);
-    glGetIntegerv(GL_BLEND_EQUATION_RGB, &pEqRGB);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &pSrcA);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &pDstA);
-    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &pEqA);
-    memcpy(pVp, vp, sizeof(vp));
-
-    if (p_bind_vao) p_bind_vao(0);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);
-    glViewport(0, 0, W, H);
-    glActiveTexture(GL_TEXTURE0);
-
-    if (g_mode == 0) g_mode = gl_probe_mode(W, H);
-
-    post_variant_t *pp = post_get(g_taps);
-    if (!pp) g_mode = 2;   /* 后处理程序编不出来就走纯叠加，不能黑屏 */
+    g_pc_scene = scene;
+    g_pc_out = out;
 
     int sw = W / g_shadow_div, sh = H / g_shadow_div;
     if (sw < 1) sw = 1;
     if (sh < 1) sh = 1;
-    const int shadow_on = s->shadowK > 0.001f;
+    float *blue = (float *) realloc(g_pc_blue, (size_t) sw * sh * sizeof(float));
+    float *shadow = (float *) realloc(g_pc_shadow, (size_t) sw * sh * sizeof(float));
+    float *light = (float *) realloc(g_pc_light, (size_t) sw * sh * sizeof(float) * 3);
+    if (!blue || !shadow || !light) {
+        free(blue); free(shadow); free(light);
+        return false;
+    }
+    g_pc_blue = blue;
+    g_pc_shadow = shadow;
+    g_pc_light = light;
+    g_pc_w = W;
+    g_pc_h = H;
+    return true;
+}
 
-    if (g_mode == 1 && g_fbo_light && fill_scene(W, H)) {
-        /* —— 阴影：场景按档位降采样，模糊后按蓝色通道取阴影 —— */
-        if (g_fbo_shadow && p_bind_fb) {
-            glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
-            if (g_shadow_w != sw || g_shadow_h != sh) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                g_shadow_w = sw;
-                g_shadow_h = sh;
-                p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
-                p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_shadow_tex, 0);
-            }
-            if (shadow_on) {
-                p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
-                glViewport(0, 0, sw, sh);
-                glDisable(GL_BLEND);
-                bind_quad(g_prog_shadow, a_shadow, u_shadow_center, u_shadow_size, 1.f, 1.f);
-                glUniform2f(u_shadow_res, (float)sw, (float)sh);
-                glUniform1f(u_shadow_m, s->shadowM);
-                glUniform1i(u_shadow_scene, 0);
-                glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                p_bind_fb(GL_FRAMEBUFFER, 0);
-                glViewport(0, 0, W, H);
-            }
+static bool pc_capture(int W, int H) {
+    patch_handle_t arr = patchlib_array_create((size_t) W * H, g_pc_color_type);
+    if (!patchlib_is_valid(arr)) return false;
+    void *args[1] = { &arr };
+    bool ok = patchlib_method_invoke_args(g_pc_m_backbuffer, g_pc_gd, NULL, args);
+    if (ok) patchlib_array_copy_to_c(g_pc_scene, arr, (size_t) W * H);
+    patchlib_free(arr);
+    return ok;
+}
+
+static inline float pc_clampf(float v, float a, float b) {
+    return v < a ? a : (v > b ? b : v);
+}
+
+static inline float pc_smooth(float a, float b, float x) {
+    if (a == b) return x < a ? 0.0f : 1.0f;
+    float t = pc_clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float pc_shadow_at(const float *mask, int sw, int sh, float x, float y) {
+    x -= 0.5f;
+    y -= 0.5f;
+    int x0 = (int) floorf(x), y0 = (int) floorf(y);
+    float fx = x - x0, fy = y - y0;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    if (x0 < 0) x0 = 0; if (x0 >= sw) x0 = sw - 1;
+    if (x1 < 0) x1 = 0; if (x1 >= sw) x1 = sw - 1;
+    if (y0 < 0) y0 = 0; if (y0 >= sh) y0 = sh - 1;
+    if (y1 < 0) y1 = 0; if (y1 >= sh) y1 = sh - 1;
+    float a = mask[y0 * sw + x0], b = mask[y0 * sw + x1];
+    float c = mask[y1 * sw + x0], d = mask[y1 * sw + x1];
+    return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+}
+
+static void pc_compute(const light_snap_t *s, int W, int H) {
+    int sw = W / g_shadow_div, sh = H / g_shadow_div;
+    if (sw < 1) sw = 1;
+    if (sh < 1) sh = 1;
+    int taps = g_taps;
+    if (taps < 4) taps = 4;
+    if (taps > 30) taps = 30;
+
+    /* 低分辨率蓝通道 → 阴影 */
+    for (int y = 0; y < sh; ++y) {
+        int sy = y * H / sh;
+        for (int x = 0; x < sw; ++x) {
+            int sx = x * W / sw;
+            g_pc_blue[y * sw + x] = g_pc_scene[((size_t) sy * W + sx) * 4 + 2] / 255.0f;
         }
-
-        if (s->glowA > 0.004f) {
-            /* —— 光照/光柱：低分辨率累加，省掉全屏 RAY_TAPS 次采样 —— */
-            glBindTexture(GL_TEXTURE_2D, g_light_tex);
-            if (g_light_w != sw || g_light_h != sh) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                g_light_w = sw;
-                g_light_h = sh;
-                if (p_bind_fb) {
-                    p_bind_fb(GL_FRAMEBUFFER, g_fbo_light);
-                    p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_light_tex, 0);
+    }
+    float m = s->shadowM;
+    for (int y = 0; y < sh; ++y) {
+        for (int x = 0; x < sw; ++x) {
+            float b = 0.0f;
+            for (int dy = -1; dy <= 1; ++dy) {
+                int yy = y + dy; if (yy < 0) yy = 0; if (yy >= sh) yy = sh - 1;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int xx = x + dx; if (xx < 0) xx = 0; if (xx >= sw) xx = sw - 1;
+                    b += g_pc_blue[yy * sw + xx];
                 }
             }
-            if (p_bind_fb) {
-                p_bind_fb(GL_FRAMEBUFFER, g_fbo_light);
-                glViewport(0, 0, sw, sh);
-                glDisable(GL_BLEND);
-                bind_quad(pp->prog, pp->apos, pp->center, pp->size, 1.f, 1.f);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
-                glUniform1i(pp->shadow, 0);
-                glUniform2f(pp->res, (float)sw, (float)sh);
-                glUniform2f(pp->sun, s->sunU, s->sunV);
-                glUniform3f(pp->color, s->warmR, s->warmG, s->warmB);
-                glUniform1f(pp->beam, s->glowA);
-                glUniform1f(pp->rays, g_cfg_rays);
-                glUniform1f(pp->shadow_k, s->shadowK);
-                glUniform1f(pp->shadow_strength, g_cfg_shadow);
-                /* 采样少的时候把步长拉大，让光柱长度和 30 采样时接近 */
-                glUniform1f(pp->zoom, 3.2f / (float)pp->taps);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                p_bind_fb(GL_FRAMEBUFFER, 0);
-                glViewport(0, 0, W, H);
-
-                /* —— 合成：场景做黄/白色温，再叠回低分辨率光照图 —— */
-                glDisable(GL_BLEND);
-                bind_quad(g_prog_composite, a_composite, u_composite_center,
-                          u_composite_size, 1.f, 1.f);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-                glUniform1i(u_composite_scene, 0);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, g_light_tex);
-                glUniform1i(u_composite_light, 1);
-                glUniform3f(u_composite_grade, s->gradeR, s->gradeG, s->gradeB);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, 0);
-            }
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, 0);
-        }
-    } else {
-        /* —— 纯叠加：光晕加色 + 色罩乘法（不读帧缓冲） —— */
-        glEnable(GL_BLEND);
-        glBlendEquation(GL_FUNC_ADD);
-
-        glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
-        bind_quad(g_prog_tint, a_tint, u_tint_center, u_tint_size, 1.f, 1.f);
-        glUniform2f(u_tint_res, (float)W, (float)H);
-        glUniform3f(u_tint_top, s->topR, s->topG, s->topB);
-        glUniform3f(u_tint_bottom, s->botR, s->botG, s->botB);
-        glUniform1f(u_tint_vignette, s->vignette);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-        if (s->glowA > 0.004f && s->sunU > -0.35f && s->sunU < 1.35f &&
-            s->sunV > -0.35f && s->sunV < 1.35f) {
-            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
-            bind_quad(g_prog_glow, a_glow, u_glow_center, u_glow_size, 1.f, 1.f);
-            glUniform2f(u_glow_res, (float)W, (float)H);
-            glUniform2f(u_glow_sun, s->sunU, s->sunV);
-            glUniform3f(u_glow_color, s->warmR, s->warmG, s->warmB);
-            glUniform1f(u_glow_strength, s->glowA);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            b /= 9.0f;
+            float v = powf(pc_clampf(1.0f - b, 0.0f, 1.0f), 0.75f);
+            v *= 1.0f - pc_smooth(m * 0.72f, m, b);
+            g_pc_shadow[y * sw + x] = s->shadowK > 0.001f ? v : 0.0f;
         }
     }
 
-    if (p_bind_fb) p_bind_fb(GL_FRAMEBUFFER, (GLuint)pFbo);
-    if (p_bind_vao && pVao) p_bind_vao((GLuint)pVao);
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)pBuf);
-    glUseProgram((GLuint)pProg);
-    glActiveTexture((GLuint)pAct);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)pTex);
-    glBlendEquationSeparate((GLenum)pEqRGB, (GLenum)pEqA);
-    glBlendFuncSeparate((GLenum)pSrcRGB, (GLenum)pDstRGB, (GLenum)pSrcA, (GLenum)pDstA);
-    if (pBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (pDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (pCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    if (pScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    glViewport(pVp[0], pVp[1], pVp[2], pVp[3]);
+    /* 光柱：沿太阳方向缩放采样阴影 */
+    float sunY = 1.0f - s->sunV;
+    float aspect = (float) sw / (float) sh;
+    float zoom = 3.2f / (float) taps;
+    float shade_k = 0.09f * s->shadowK * g_cfg_rays * g_cfg_shadow;
+    for (int y = 0; y < sh; ++y) {
+        float uvy = (y + 0.5f) / (float) sh;
+        for (int x = 0; x < sw; ++x) {
+            float uvx = (x + 0.5f) / (float) sw;
+            float dx = (uvx - s->sunU) * aspect;
+            float dy = uvy - sunY;
+            float r = sqrtf(dx * dx + dy * dy);
+            float fall = 1.0f - r / 1.15f;
+            if (fall < 0.0f) fall = 0.0f;
+            fall *= fall;
+
+            float shade = 0.0f;
+            if (s->shadowK > 0.001f) {
+                float sum = 0.0f;
+                for (int i = 0; i < taps; ++i) {
+                    float k = 1.0f + (float) i * zoom;
+                    float px = s->sunU + (uvx - s->sunU) / k;
+                    float py = sunY + (uvy - sunY) / k;
+                    sum += pc_shadow_at(g_pc_shadow, sw, sh, px * sw, py * sh) *
+                           (1.0f - (float) i / 30.0f);
+                }
+                shade = pc_clampf(sum * shade_k, 0.0f, 1.0f);
+            }
+            float lit = 1.0f - 0.96f * shade;
+            float v = fall * s->glowA * lit;
+            size_t o = ((size_t) y * sw + x) * 3;
+            g_pc_light[o + 0] = s->warmR * v;
+            g_pc_light[o + 1] = s->warmG * v;
+            g_pc_light[o + 2] = s->warmB * v;
+        }
+    }
+
+    /* 全分辨率：场景色温 + 低分辨率光照上采样 */
+    for (int y = 0; y < H; ++y) {
+        float ly = ((float) y + 0.5f) * sh / H - 0.5f;
+        int y0 = (int) floorf(ly), y1 = y0 + 1;
+        float fy = ly - y0;
+        if (y0 < 0) y0 = 0; if (y0 >= sh) y0 = sh - 1;
+        if (y1 < 0) y1 = 0; if (y1 >= sh) y1 = sh - 1;
+
+        for (int x = 0; x < W; ++x) {
+            float lx = ((float) x + 0.5f) * sw / W - 0.5f;
+            int x0 = (int) floorf(lx), x1 = x0 + 1;
+            float fx = lx - x0;
+            if (x0 < 0) x0 = 0; if (x0 >= sw) x0 = sw - 1;
+            if (x1 < 0) x1 = 0; if (x1 >= sw) x1 = sw - 1;
+
+            size_t i00 = ((size_t) y0 * sw + x0) * 3;
+            size_t i10 = ((size_t) y0 * sw + x1) * 3;
+            size_t i01 = ((size_t) y1 * sw + x0) * 3;
+            size_t i11 = ((size_t) y1 * sw + x1) * 3;
+            float a0 = g_pc_light[i00] + (g_pc_light[i10] - g_pc_light[i00]) * fx;
+            float a1 = g_pc_light[i01] + (g_pc_light[i11] - g_pc_light[i01]) * fx;
+            float lr = a0 + (a1 - a0) * fy;
+            a0 = g_pc_light[i00 + 1] + (g_pc_light[i10 + 1] - g_pc_light[i00 + 1]) * fx;
+            a1 = g_pc_light[i01 + 1] + (g_pc_light[i11 + 1] - g_pc_light[i01 + 1]) * fx;
+            float lg = a0 + (a1 - a0) * fy;
+            a0 = g_pc_light[i00 + 2] + (g_pc_light[i10 + 2] - g_pc_light[i00 + 2]) * fx;
+            a1 = g_pc_light[i01 + 2] + (g_pc_light[i11 + 2] - g_pc_light[i01 + 2]) * fx;
+            float lb = a0 + (a1 - a0) * fy;
+
+            size_t p = ((size_t) y * W + x) * 4;
+            float sr = g_pc_scene[p + 0] / 255.0f;
+            float sg = g_pc_scene[p + 1] / 255.0f;
+            float sb = g_pc_scene[p + 2] / 255.0f;
+            g_pc_out[p + 0] = (unsigned char) (pc_clampf(sr * s->gradeR + lr, 0, 1) * 255.0f + 0.5f);
+            g_pc_out[p + 1] = (unsigned char) (pc_clampf(sg * s->gradeG + lg, 0, 1) * 255.0f + 0.5f);
+            g_pc_out[p + 2] = (unsigned char) (pc_clampf(sb * s->gradeB + lb, 0, 1) * 255.0f + 0.5f);
+            g_pc_out[p + 3] = 255;
+        }
+    }
+}
+
+static bool pc_ensure_texture(int W, int H) {
+    if (patchlib_is_valid(g_pc_tex) && g_pc_tex_w == W && g_pc_tex_h == H &&
+        patchlib_is_valid(g_pc_tex_array))
+        return true;
+
+    g_pc_tex = terraria_texture2d_create(W, H, TEXTURE_FORMAT_RGBA32,
+                                         g_pc_out, (size_t) W * H * 4);
+    if (!patchlib_is_valid(g_pc_tex)) {
+        LOG_ERROR("PC: Texture2D 创建失败");
+        return false;
+    }
+    g_pc_tex_pin = pc_pin(g_pc_tex);
+
+    g_pc_tex_array = patchlib_array_create((size_t) W * H * 4, g_pc_uint8_type);
+    if (!patchlib_is_valid(g_pc_tex_array)) {
+        LOG_ERROR("PC: 纹理字节数组创建失败");
+        return false;
+    }
+    g_pc_arr_pin = pc_pin(g_pc_tex_array);
+    g_pc_tex_w = W;
+    g_pc_tex_h = H;
+    return true;
+}
+
+static void pc_draw_texture(int W, int H) {
+    patch_handle_t sb = PATCH_NULL;
+    if (patchlib_is_valid(g_pc_sb_field))
+        patchlib_field_get_value(g_pc_sb_field, NULL, &sb);
+    if (!patchlib_is_valid(sb)) return;
+
+    if (!patchlib_is_valid(g_pc_m_setdata)) {
+        static int once;
+        if (!once) { once = 1; LOG_ERROR("PC: Texture2D.SetData 不可用"); }
+        return;
+    }
+    if (!patchlib_array_copy_from_c(g_pc_tex_array, g_pc_out, (size_t) W * H * 4)) return;
+    void *sd_args[1] = { &g_pc_tex_array };
+    patchlib_method_invoke_args(g_pc_m_setdata, g_pc_tex, NULL, sd_args);
+
+    patchlib_method_invoke_args(g_pc_m_sb_begin, sb, NULL, NULL);
+
+    struct { int x, y, w, h; } rect = { 0, 0, W, H };
+    uint32_t white = 0xFFFFFFFFu;
+    void *draw_args[3] = { &g_pc_tex, &rect, &white };
+    patchlib_method_invoke_args(g_pc_m_draw, sb, NULL, draw_args);
+
+    patchlib_method_invoke_args(g_pc_m_sb_end, sb, NULL, NULL);
+}
+
+static void pc_render(const light_snap_t *s) {
+    if (!s->enabled || s->virtW <= 0 || s->virtH <= 0) return;
+    if (!pc_init_xna()) return;
+    int W = s->virtW, H = s->virtH;
+    if (patchlib_is_valid(g_pc_m_viewport)) {
+        struct { int x, y, w, h; } vp = { 0, 0, 0, 0 };
+        if (patchlib_method_invoke_args(g_pc_m_viewport, g_pc_gd, &vp, NULL) &&
+            vp.w > 0 && vp.h > 0) {
+            W = vp.w;
+            H = vp.h;
+        }
+    }
+    if (!pc_resize(W, H)) return;
+    if (!pc_capture(W, H)) {
+        static int once;
+        if (!once) { once = 1; LOG_ERROR("PC: GetBackBufferData 失败"); }
+        return;
+    }
+    pc_compute(s, W, H);
+    if (!pc_ensure_texture(W, H)) return;
+    pc_draw_texture(W, H);
+
+    static int once;
+    if (!once) {
+        once = 1;
+        LOG_INFO("PC: 首次绘制 %dx%d（阴影 1/%d，采样 %d）", W, H, g_shadow_div, g_taps);
+    }
 }
 
 /* ============================================================================
- * 五、PC：GraphicsDevice.Present 之前绘制
- *
- * FNA 在 Present 时 GL 上下文仍在游戏线程，直接做屏幕后处理。
- * Present 找不到时退回 Main.Draw 的 postfix（同样在交换之前、UI 之后）。
+ * 六、PC：Main.DrawInterface prefix（世界画完、UI 之前）
  * ========================================================================== */
 
-static patch_hook_id_t g_hook_present = PATCH_HOOK_INVALID_ID;
-static patch_hook_id_t g_hook_draw_end = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t g_hook_interface = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t g_hook_bars = PATCH_HOOK_INVALID_ID;
 static volatile int g_in_hook;
 
-static bool on_present(patch_handle_t instance, void **args,
-                       const patch_method_signature_t *sig, void *result) {
+static bool on_interface(patch_handle_t instance, void **args,
+                         const patch_method_signature_t *sig, void *result) {
     (void)instance; (void)args; (void)sig; (void)result;
     if (!g_in_hook) {
         g_in_hook = 1;
         int i = g_snap_head;
-        if (i >= 0) gl_render(&g_snap[i]);
+        if (i >= 0) pc_render(&g_snap[i]);
         g_in_hook = 0;
     }
     return false;
 }
 
-static void on_draw_end(patch_handle_t instance, void **args, void *result,
-                        const patch_method_signature_t *sig) {
-    (void)instance; (void)args; (void)result; (void)sig;
-    on_present(instance, args, sig, result);
-}
-
-static bool install_present_hook(void) {
-    patch_handle_t gd = patchlib_type_get_type("Microsoft.Xna.Framework.Graphics",
-                                               "GraphicsDevice");
-    if (patchlib_is_valid(gd)) {
-        patch_handle_t present =
-            patchlib_type_get_method_by_param_count(gd, "Present", 0);
-        if (patchlib_is_valid(present)) {
-            g_hook_present = patchlib_install_prepost_hook(present, on_present, NULL);
-            if (g_hook_present != PATCH_HOOK_INVALID_ID) {
-                LOG_INFO("已挂 GraphicsDevice.Present（屏幕后处理）");
-                return true;
-            }
-        }
-    }
-
-    patch_handle_t draw = patchlib_type_get_method_by_param_count(g_main_type, "Draw", 1);
-    if (patchlib_is_valid(draw)) {
-        g_hook_draw_end = patchlib_install_prepost_hook(draw, NULL, on_draw_end);
-        if (g_hook_draw_end != PATCH_HOOK_INVALID_ID) {
-            LOG_INFO("Present 不可用，改挂 Main.Draw postfix");
+static bool install_interface_hook(void) {
+    patch_handle_t iface =
+        patchlib_type_get_method_by_param_count(g_main_type, "DrawInterface", 1);
+    if (patchlib_is_valid(iface)) {
+        g_hook_interface = patchlib_install_prepost_hook(iface, on_interface, NULL);
+        if (g_hook_interface != PATCH_HOOK_INVALID_ID) {
+            LOG_INFO("PC: 已挂 Main.DrawInterface（世界后、UI 前）");
             return true;
         }
     }
-    LOG_ERROR("找不到 GraphicsDevice.Present / Main.Draw，无法绘制");
+
+    /* 兜底：在资源条/Buff 栏之前画，至少 Buff 栏和后面的 UI 不会被盖 */
+    patch_handle_t bars = patchlib_type_get_method_by_param_count(g_main_type, "GUIBarsDraw", 0);
+    if (patchlib_is_valid(bars)) {
+        g_hook_bars = patchlib_install_prepost_hook(bars, on_interface, NULL);
+        if (g_hook_bars != PATCH_HOOK_INVALID_ID) {
+            LOG_INFO("PC: DrawInterface 不可用，改挂 GUIBarsDraw");
+            return true;
+        }
+    }
+    LOG_ERROR("PC: 找不到 DrawInterface/GUIBarsDraw");
     return false;
 }
 
-static void uninstall_present_hook(void) {
-    if (g_hook_present != PATCH_HOOK_INVALID_ID) {
-        patchlib_uninstall_hook(g_hook_present);
-        g_hook_present = PATCH_HOOK_INVALID_ID;
+static void uninstall_interface_hook(void) {
+    if (g_hook_interface != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(g_hook_interface);
+        g_hook_interface = PATCH_HOOK_INVALID_ID;
     }
-    if (g_hook_draw_end != PATCH_HOOK_INVALID_ID) {
-        patchlib_uninstall_hook(g_hook_draw_end);
-        g_hook_draw_end = PATCH_HOOK_INVALID_ID;
+    if (g_hook_bars != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(g_hook_bars);
+        g_hook_bars = PATCH_HOOK_INVALID_ID;
     }
 }
 
@@ -1200,11 +921,11 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
     snap_commit();
 
     if ((g_frames % 600) == 1) {
-        LOG_INFO("档位=%s 采样=%d 阴影=1/%d 太阳uvx1000=(%d,%d) 光强x100=%d 光柱x100=%d 阴影x100=%d 模式=%d",
+        LOG_INFO("档位=%s 采样=%d 阴影=1/%d 太阳uvx1000=(%d,%d) 光强x100=%d 光柱x100=%d 阴影x100=%d",
                  quality_name(g_quality), g_taps, g_shadow_div,
                  (int)(s->sunU * 1000), (int)(s->sunV * 1000),
                  (int)(s->glowA * 100), (int)(g_cfg_rays * 100),
-                 (int)(s->shadowK * 100), g_mode);
+                 (int)(s->shadowK * 100));
     }
 }
 
@@ -1235,7 +956,7 @@ static void init_mod(kernel_mod_handle_t *handle) {
     g_hook_draw = patchlib_install_prepost_hook(draw_method, NULL, on_draw);
     if (g_hook_draw == PATCH_HOOK_INVALID_ID) { LOG_ERROR("快照钩子安装失败"); return; }
 
-    if (!install_present_hook()) LOG_ERROR("屏幕后处理绘制钩子安装失败");
+    if (!install_interface_hook()) LOG_ERROR("屏幕后处理绘制钩子安装失败");
 
     read_config_json();
     read_settings_txt();
@@ -1243,13 +964,13 @@ static void init_mod(kernel_mod_handle_t *handle) {
              quality_name(g_quality), g_taps, g_shadow_div, g_cfg_shadow,
              g_light_color ? "白光" : "黄光", g_cfg_glow, g_cfg_rays,
              g_enabled ? "" : " — 已关闭，不绘制");
-    LOG_INFO("初始化完成 v%s（快照 hook=%d present=%d draw_end=%d）", MOD_VERSION,
-             (int)g_hook_draw, (int)g_hook_present, (int)g_hook_draw_end);
+    LOG_INFO("初始化完成 v%s（快照 hook=%d 界面 hook=%d bars=%d）", MOD_VERSION,
+             (int)g_hook_draw, (int)g_hook_interface, (int)g_hook_bars);
 }
 
 static void cleanup_mod(kernel_mod_handle_t *handle) {
     (void)handle;
-    uninstall_present_hook();
+    uninstall_interface_hook();
     if (g_hook_draw != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(g_hook_draw);
         g_hook_draw = PATCH_HOOK_INVALID_ID;
