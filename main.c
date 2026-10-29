@@ -48,7 +48,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.5.0-light"
+#define MOD_VERSION "2.6.3-light"
 
 /* ============================================================================
  * 配置
@@ -57,13 +57,16 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
  *
  * config.json（TEFManager 生成）：
  *   {"schemaVersion":1,"values":{"enabled":true,"quality":"balanced",
- *    "ray_samples":16,"shadow_div":3,"glow":60,"rays":55}}
+ *    "ray_samples":16,"shadow_div":3,"glow":60,"rays":55,
+ *    "shadow_strength":135,"light_color":"warm"}}
  *
  * ls_settings.txt：
  *   glow=0.60   光晕强度（0 = 关掉）
  *   rays=0.55   光柱强度（0 = 关掉，只剩光晕）
+ *   shadow_strength=1.35  阴影强度 0.3..2.5（1.0 = 基准）
+ *   light=warm  光色：warm=黄光，white=白光
  *   taps=16     光柱采样数 4..30（越大越细腻、越慢）
- *   shadow=3    阴影降采样倍数 2..6（越小越清晰、越慢）
+ *   shadow=3    阴影/光柱降采样倍数 2..6（越小越清晰、越慢）
  *   sun=-1      调试：强制太阳时刻 0..1（<0 = 用游戏时间）
  * ========================================================================== */
 
@@ -75,6 +78,8 @@ static int   g_taps       = 16;     /* 光柱采样数，决定用哪份着色�
 static int   g_shadow_div = 3;      /* 阴影图 = 画面 1/N */
 static float g_cfg_glow   = 0.60f;
 static float g_cfg_rays   = 0.55f;
+static float g_cfg_shadow = 1.35f;  /* 阴影强度 0.3..2.5，1.0 = 基准 */
+static int   g_light_color = 0;     /* 0 = 黄光（默认），1 = 白光 */
 static float g_cfg_sun    = -1.0f;
 static char  g_private_dir[1024];
 
@@ -184,6 +189,12 @@ static void read_config_json(void) {
             glow = json_int(o, "glow", 60);
             rays = json_int(o, "rays", 55);
 
+            g_cfg_shadow = clampf((float)json_int(o, "shadow_strength", 135) / 100.0f,
+                                  0.3f, 2.5f);
+            char lc[16];
+            json_str(o, "light_color", lc, sizeof(lc), "warm");
+            g_light_color = (!strcmp(lc, "white") || !strcmp(lc, "cool")) ? 1 : 0;
+
             char q[16];
             json_str(o, "quality", q, sizeof(q), "balanced");
             if (!strcmp(q, "perf") || !strcmp(q, "performance")) g_quality = Q_PERF;
@@ -214,11 +225,18 @@ static void read_settings_txt(void) {
         while (*key == ' ' || *key == '\t') ++key;
         char *end = key + strlen(key);
         while (end > key && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
-        float v = (float)atof(eq + 1);
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') ++val;
+        float v = (float)atof(val);
         if (!strcmp(key, "glow")) g_cfg_glow = clampf(v, 0.0f, 1.5f);
         else if (!strcmp(key, "rays")) g_cfg_rays = clampf(v, 0.0f, 1.5f);
         else if (!strcmp(key, "taps")) g_taps = (int)clampf(v, 4.0f, 30.0f);
         else if (!strcmp(key, "shadow")) g_shadow_div = (int)clampf(v, 2.0f, 6.0f);
+        else if (!strcmp(key, "shadow_strength") || !strcmp(key, "shadowstr"))
+            g_cfg_shadow = clampf(v, 0.3f, 2.5f);
+        else if (!strcmp(key, "light") || !strcmp(key, "light_color") ||
+                 !strcmp(key, "color"))
+            g_light_color = (!strncmp(val, "white", 5) || !strncmp(val, "1", 1)) ? 1 : 0;
         else if (!strcmp(key, "sun")) g_cfg_sun = v;
     }
     fclose(f);
@@ -330,6 +348,7 @@ typedef struct {
     float shadowM;               /* 阴影提取阈值：蓝通道低于它算阴影 */
     float shadowK;               /* 阴影强度（夜里关掉，0 = 不画条纹） */
     float warmR, warmG, warmB;   /* 光晕颜色 */
+    float gradeR, gradeG, gradeB;/* 黄光/白光的整屏色温 */
     float glowA;                 /* 光晕强度 */
     float topR, topG, topB;      /* 天空顶部色（乘法） */
     float botR, botG, botB;      /* 地平线色（乘法） */
@@ -395,25 +414,41 @@ static void compute_light(light_snap_t *s) {
     float intensity = day ? (0.35f + DAY_GAIN * lift)
                           : (0.30f + NIGHT_GAIN * lift) * moonK;
 
-    /* 光色：按一天里的时刻插值（黎明淡紫 → 正午暖黄 → 黄昏橙红），夜里冷蓝 */
+    /* 光色：黄光走暖黄（正午偏金黄），白光固定为略偏冷的中性白 */
     if (day) {
         if (t01 < 0.5f) {
             float u = t01 * 2.0f;
-            s->warmR = 0.73f + 0.13f * u;
-            s->warmG = 0.54f + 0.22f * u;
-            s->warmB = 0.58f - 0.06f * u;
+            s->warmR = 0.95f + 0.05f * u;
+            s->warmG = 0.64f + 0.23f * u;
+            s->warmB = 0.32f + 0.14f * u;
         } else {
             float u = (t01 - 0.5f) * 2.0f;
-            s->warmR = 0.86f - 0.14f * u;
-            s->warmG = 0.76f - 0.46f * u;
-            s->warmB = 0.52f - 0.14f * u;
+            s->warmR = 1.00f;
+            s->warmG = 0.87f - 0.28f * u;
+            s->warmB = 0.46f - 0.26f * u;
         }
     } else {
+        /* 黄光模式下的月光也保留一点暖琥珀色，不偏蓝 */
         float w = (1.0f - moonK) * 0.5f;
-        s->warmR = 0.42f + 0.24f * w;
-        s->warmG = 0.52f + 0.16f * w;
-        s->warmB = 0.92f;
+        s->warmR = 0.78f + 0.08f * w;
+        s->warmG = 0.70f + 0.05f * w;
+        s->warmB = 0.50f - 0.04f * w;
     }
+    if (g_light_color == 1) {
+        s->warmR = 0.96f;
+        s->warmG = 0.98f;
+        s->warmB = 1.00f;
+        /* 白光只靠光晕太不明显，再给整屏一个很淡的冷色，和暖色拉开差距 */
+        s->gradeR = 0.985f;
+        s->gradeG = 0.995f;
+        s->gradeB = 1.03f;
+    } else {
+        /* 整屏色温只压一点点蓝，避免像老旧电视 */
+        s->gradeR = day ? 1.035f : 1.02f;
+        s->gradeG = day ? 0.985f : 0.995f;
+        s->gradeB = day ? 0.84f : 0.93f;
+    }
+
     s->glowA = intensity * g_cfg_glow;
     if (s->glowA > 1.2f) s->glowA = 1.2f;
 
@@ -458,16 +493,17 @@ static int g_gl_state;
 static int g_mode;
 static int g_use_blit;
 static GLuint g_vbo;
-static GLuint g_prog_tint, g_prog_glow, g_prog_shadow;
-static GLuint g_scene_tex, g_shadow_tex;
-static GLuint g_fbo_scene, g_fbo_shadow;
-static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h;
+static GLuint g_prog_tint, g_prog_glow, g_prog_shadow, g_prog_composite;
+static GLuint g_scene_tex, g_shadow_tex, g_light_tex;
+static GLuint g_fbo_scene, g_fbo_shadow, g_fbo_light;
+static int g_scene_w, g_scene_h, g_shadow_w, g_shadow_h, g_light_w, g_light_h;
 
 /* 光柱采样数是着色器里的循环上界，必须编译期常量；
  * 所以每档采样数各编译一份，只在用到的档位编一次（一局只编一份）。 */
 typedef struct {
     GLuint prog;
-    GLint  apos, center, size, scene, shadow, res, sun, color, beam, rays, shadow_k, zoom;
+    GLint  apos, center, size, shadow, res, sun, color, beam, rays, shadow_k,
+           shadow_strength, zoom;
     int    taps;
     int    state;                 /* 0=未编译 1=可用 -1=失败 */
 } post_variant_t;
@@ -477,6 +513,8 @@ static GLint a_glow, u_glow_center, u_glow_size, u_glow_res, u_glow_sun,
              u_glow_color, u_glow_strength;
 static GLint a_shadow, u_shadow_scene, u_shadow_res, u_shadow_m,
              u_shadow_center, u_shadow_size;
+static GLint a_composite, u_composite_scene, u_composite_light, u_composite_grade,
+             u_composite_center, u_composite_size;
 
 #define GL_VERTEX_ARRAY_BINDING_OES 0x85B5
 #define GL_FRAMEBUFFER_BINDING 0x8CA6
@@ -546,7 +584,7 @@ static const char *FS_GLOW =
     "  gl_FragColor = vec4(uColor * fall * fall * uStrength, 1.0);\n"
     "}\n";
 
-/* —— 阴影提取（1/3 分辨率）：蓝通道低于阈值 m 的像素算阴影 —— */
+/* —— 阴影提取（降采样）：先做 3x3 模糊软化图格边缘，再按蓝通道取阴影 —— */
 static const char *FS_SHADOW =
     "precision mediump float;\n"
     "uniform sampler2D uScene;\n"
@@ -554,15 +592,26 @@ static const char *FS_SHADOW =
     "uniform float uM;\n"
     "void main(){\n"
     "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  float b = texture2D(uScene, uv).b;\n"
-    "  float s = (b < uM) ? pow(1.0 - b, 0.75) : 0.0;\n"
+    "  vec2 t = 1.5 / uRes;\n"
+    "  float b = 0.0;\n"
+    "  b += texture2D(uScene, uv + vec2(-t.x, -t.y)).b;\n"
+    "  b += texture2D(uScene, uv + vec2( 0.0, -t.y)).b;\n"
+    "  b += texture2D(uScene, uv + vec2( t.x, -t.y)).b;\n"
+    "  b += texture2D(uScene, uv + vec2(-t.x,  0.0)).b;\n"
+    "  b += texture2D(uScene, uv).b;\n"
+    "  b += texture2D(uScene, uv + vec2( t.x,  0.0)).b;\n"
+    "  b += texture2D(uScene, uv + vec2(-t.x,  t.y)).b;\n"
+    "  b += texture2D(uScene, uv + vec2( 0.0,  t.y)).b;\n"
+    "  b += texture2D(uScene, uv + vec2( t.x,  t.y)).b;\n"
+    "  b /= 9.0;\n"
+    "  float s = pow(max(1.0 - b, 0.0), 0.75);\n"
+    "  s *= 1.0 - smoothstep(uM * 0.72, uM, b);\n"
     "  gl_FragColor = vec4(s, s, s, 1.0);\n"
     "}\n";
 
-/* —— 最终合成：光晕 − 沿太阳方向的阴影条纹，additive 叠回场景 —— */
-static const char *FS_POST =
+/* —— 光照/光柱：在半分辨率下累加阴影，输出纯光色（不读场景） —— */
+static const char *FS_LIGHT =
     "precision mediump float;\n"
-    "uniform sampler2D uScene;\n"
     "uniform sampler2D uShadow;\n"
     "uniform vec2 uRes;\n"
     "uniform vec2 uSun;\n"
@@ -570,10 +619,10 @@ static const char *FS_POST =
     "uniform float uBeam;\n"
     "uniform float uRays;\n"
     "uniform float uShadowK;\n"
+    "uniform float uShadowStrength;\n"
     "uniform float uZoom;\n"
     "void main(){\n"
     "  vec2 uv = gl_FragCoord.xy / uRes;\n"
-    "  vec3 scene = texture2D(uScene, uv).rgb;\n"
     "  vec2 d = (uv - uSun) * vec2(uRes.x / uRes.y, 1.0);\n"
     "  float r = length(d);\n"
     "  float fade = max(0.0, 1.0 - r / 1.15);\n"
@@ -584,9 +633,21 @@ static const char *FS_POST =
     "    vec2 p = uSun + (uv - uSun) / k;\n"
     "    shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
     "  }\n"
-    "  shade = clamp(shade * 0.09 * uShadowK * uRays, 0.0, 1.0);\n"
-    "  vec3 light = uColor * fall * uBeam * (1.0 - 0.85 * shade);\n"
-    "  gl_FragColor = vec4(scene + light, 1.0);\n"
+    "  shade = clamp(shade * 0.09 * uShadowK * uRays * uShadowStrength, 0.0, 1.0);\n"
+    "  float lit = max(0.0, 1.0 - 0.96 * shade);\n"
+    "  gl_FragColor = vec4(uColor * fall * uBeam * lit, 1.0);\n"
+    "}\n";
+
+/* —— 把降采样的光照图叠回场景，并做黄光/白光的整屏色温 —— */
+static const char *FS_COMPOSITE =
+    "precision mediump float;\n"
+    "uniform sampler2D uScene;\n"
+    "uniform sampler2D uLight;\n"
+    "uniform vec3 uGrade;\n"
+    "varying vec2 vUV;\n"
+    "void main(){\n"
+    "  vec3 scene = texture2D(uScene, vUV).rgb * uGrade;\n"
+    "  gl_FragColor = vec4(scene + texture2D(uLight, vUV).rgb, 1.0);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src, const char *tag) {
@@ -640,7 +701,7 @@ static int post_build(post_variant_t *v, int taps) {
     GLuint vs = compile_shader(GL_VERTEX_SHADER, VS_SRC, "VS");
     if (!vs) return -1;
     char src[8192];
-    int n = snprintf(src, sizeof(src), "%s%s", hdr, FS_POST);
+    int n = snprintf(src, sizeof(src), "%s%s", hdr, FS_LIGHT);
     if (n <= 0 || (size_t)n >= sizeof(src)) { glDeleteShader(vs); return -1; }
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, src, "光-阴影");
     if (!fs) { glDeleteShader(vs); return -1; }
@@ -669,7 +730,6 @@ static int post_build(post_variant_t *v, int taps) {
     v->prog      = prog;
     v->taps      = taps;
     v->apos      = glGetAttribLocation(prog, "aPos");
-    v->scene     = glGetUniformLocation(prog, "uScene");
     v->shadow    = glGetUniformLocation(prog, "uShadow");
     v->res       = glGetUniformLocation(prog, "uRes");
     v->sun       = glGetUniformLocation(prog, "uSun");
@@ -677,6 +737,7 @@ static int post_build(post_variant_t *v, int taps) {
     v->beam      = glGetUniformLocation(prog, "uBeam");
     v->rays      = glGetUniformLocation(prog, "uRays");
     v->shadow_k  = glGetUniformLocation(prog, "uShadowK");
+    v->shadow_strength = glGetUniformLocation(prog, "uShadowStrength");
     v->zoom      = glGetUniformLocation(prog, "uZoom");
     v->center    = glGetUniformLocation(prog, "uCenter");
     v->size      = glGetUniformLocation(prog, "uSize");
@@ -703,7 +764,8 @@ static bool gl_build(void) {
     g_prog_shadow = build_program(FS_SHADOW, "阴影");
     g_prog_tint   = build_program(FS_TINT,   "色罩");
     g_prog_glow   = build_program(FS_GLOW,   "光晕");
-    if (!g_prog_shadow || !g_prog_tint || !g_prog_glow) {
+    g_prog_composite = build_program(FS_COMPOSITE, "合成");
+    if (!g_prog_shadow || !g_prog_tint || !g_prog_glow || !g_prog_composite) {
         LOG_ERROR("GL 程序构建失败");
         g_gl_state = -1;
         return false;
@@ -715,6 +777,13 @@ static bool gl_build(void) {
     u_shadow_m     = glGetUniformLocation(g_prog_shadow, "uM");
     u_shadow_center = glGetUniformLocation(g_prog_shadow, "uCenter");
     u_shadow_size   = glGetUniformLocation(g_prog_shadow, "uSize");
+
+    a_composite = glGetAttribLocation(g_prog_composite, "aPos");
+    u_composite_scene = glGetUniformLocation(g_prog_composite, "uScene");
+    u_composite_light = glGetUniformLocation(g_prog_composite, "uLight");
+    u_composite_grade = glGetUniformLocation(g_prog_composite, "uGrade");
+    u_composite_center = glGetUniformLocation(g_prog_composite, "uCenter");
+    u_composite_size = glGetUniformLocation(g_prog_composite, "uSize");
 
     a_tint = glGetAttribLocation(g_prog_tint, "aPos");
     u_tint_center = glGetUniformLocation(g_prog_tint, "uCenter");
@@ -732,7 +801,7 @@ static bool gl_build(void) {
     u_glow_color = glGetUniformLocation(g_prog_glow, "uColor");
     u_glow_strength = glGetUniformLocation(g_prog_glow, "uStrength");
 
-    if (a_shadow < 0 || a_tint < 0 || a_glow < 0) {
+    if (a_shadow < 0 || a_tint < 0 || a_glow < 0 || a_composite < 0) {
         LOG_ERROR("aPos 无效");
         g_gl_state = -1;
         return false;
@@ -743,11 +812,12 @@ static bool gl_build(void) {
     glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    GLuint tex[2] = { 0, 0 };
-    glGenTextures(2, tex);
+    GLuint tex[3] = { 0, 0, 0 };
+    glGenTextures(3, tex);
     g_scene_tex = tex[0];
     g_shadow_tex = tex[1];
-    for (int i = 0; i < 2; ++i) {
+    g_light_tex = tex[2];
+    for (int i = 0; i < 3; ++i) {
         glBindTexture(GL_TEXTURE_2D, tex[i]);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -764,16 +834,18 @@ static bool gl_build(void) {
 
     g_fbo_scene = 0;
     g_fbo_shadow = 0;
+    g_fbo_light = 0;
     if (p_gen_fb && p_bind_fb && p_fb_tex) {
-        GLuint fb[2] = { 0, 0 };
-        p_gen_fb(2, fb);
+        GLuint fb[3] = { 0, 0, 0 };
+        p_gen_fb(3, fb);
         g_fbo_scene = fb[0];
         g_fbo_shadow = fb[1];
+        g_fbo_light = fb[2];
     }
 
     g_gl_state = 1;
-    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u/%u）", MOD_VERSION,
-             p_blit ? 1 : 0, g_fbo_scene, g_fbo_shadow);
+    LOG_INFO("GL 就绪 v%s（blit=%d fbo=%u/%u/%u）", MOD_VERSION,
+             p_blit ? 1 : 0, g_fbo_scene, g_fbo_shadow, g_fbo_light);
     return true;
 }
 
@@ -885,11 +957,13 @@ static void gl_render(const light_snap_t *s) {
     post_variant_t *pp = post_get(g_taps);
     if (!pp) g_mode = 2;   /* 后处理程序编不出来就走纯叠加，不能黑屏 */
 
-    if (g_mode == 1 && fill_scene(W, H)) {
-        /* —— 阴影：场景按档位降采样，按蓝色通道取阴影 —— */
-        int sw = W / g_shadow_div, sh = H / g_shadow_div;
-        if (sw < 1) sw = 1;
-        if (sh < 1) sh = 1;
+    int sw = W / g_shadow_div, sh = H / g_shadow_div;
+    if (sw < 1) sw = 1;
+    if (sh < 1) sh = 1;
+    const int shadow_on = s->shadowK > 0.001f;
+
+    if (g_mode == 1 && g_fbo_light && fill_scene(W, H)) {
+        /* —— 阴影：场景按档位降采样，模糊后按蓝色通道取阴影 —— */
         if (g_fbo_shadow && p_bind_fb) {
             glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
             if (g_shadow_w != sw || g_shadow_h != sh) {
@@ -899,40 +973,72 @@ static void gl_render(const light_snap_t *s) {
                 p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
                 p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_shadow_tex, 0);
             }
-            p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
-            glViewport(0, 0, sw, sh);
-            glDisable(GL_BLEND);
-            bind_quad(g_prog_shadow, a_shadow, u_shadow_center, u_shadow_size, 1.f, 1.f);
-            glUniform2f(u_shadow_res, (float)sw, (float)sh);
-            glUniform1f(u_shadow_m, s->shadowM);
-            glUniform1i(u_shadow_scene, 0);
-            glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            p_bind_fb(GL_FRAMEBUFFER, 0);
-            glViewport(0, 0, W, H);
+            if (shadow_on) {
+                p_bind_fb(GL_FRAMEBUFFER, g_fbo_shadow);
+                glViewport(0, 0, sw, sh);
+                glDisable(GL_BLEND);
+                bind_quad(g_prog_shadow, a_shadow, u_shadow_center, u_shadow_size, 1.f, 1.f);
+                glUniform2f(u_shadow_res, (float)sw, (float)sh);
+                glUniform1f(u_shadow_m, s->shadowM);
+                glUniform1i(u_shadow_scene, 0);
+                glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                p_bind_fb(GL_FRAMEBUFFER, 0);
+                glViewport(0, 0, W, H);
+            }
         }
 
-        /* —— 合成：光晕 − 条纹，additive 叠回 —— */
-        glDisable(GL_BLEND);
-        bind_quad(pp->prog, pp->apos, pp->center, pp->size, 1.f, 1.f);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-        glUniform1i(pp->scene, 0);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
-        glUniform1i(pp->shadow, 1);
-        glUniform2f(pp->res, (float)W, (float)H);
-        glUniform2f(pp->sun, s->sunU, s->sunV);
-        glUniform3f(pp->color, s->warmR, s->warmG, s->warmB);
-        glUniform1f(pp->beam, s->glowA);
-        glUniform1f(pp->rays, g_cfg_rays);
-        glUniform1f(pp->shadow_k, s->shadowK);
-        /* 采样少的时候把步长拉大，让光柱长度和 30 采样时接近 */
-        glUniform1f(pp->zoom, 3.2f / (float)pp->taps);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glActiveTexture(GL_TEXTURE0);
+        if (s->glowA > 0.004f) {
+            /* —— 光照/光柱：低分辨率累加，省掉全屏 RAY_TAPS 次采样 —— */
+            glBindTexture(GL_TEXTURE_2D, g_light_tex);
+            if (g_light_w != sw || g_light_h != sh) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                g_light_w = sw;
+                g_light_h = sh;
+                if (p_bind_fb) {
+                    p_bind_fb(GL_FRAMEBUFFER, g_fbo_light);
+                    p_fb_tex(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_light_tex, 0);
+                }
+            }
+            if (p_bind_fb) {
+                p_bind_fb(GL_FRAMEBUFFER, g_fbo_light);
+                glViewport(0, 0, sw, sh);
+                glDisable(GL_BLEND);
+                bind_quad(pp->prog, pp->apos, pp->center, pp->size, 1.f, 1.f);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
+                glUniform1i(pp->shadow, 0);
+                glUniform2f(pp->res, (float)sw, (float)sh);
+                glUniform2f(pp->sun, s->sunU, s->sunV);
+                glUniform3f(pp->color, s->warmR, s->warmG, s->warmB);
+                glUniform1f(pp->beam, s->glowA);
+                glUniform1f(pp->rays, g_cfg_rays);
+                glUniform1f(pp->shadow_k, s->shadowK);
+                glUniform1f(pp->shadow_strength, g_cfg_shadow);
+                /* 采样少的时候把步长拉大，让光柱长度和 30 采样时接近 */
+                glUniform1f(pp->zoom, 3.2f / (float)pp->taps);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                p_bind_fb(GL_FRAMEBUFFER, 0);
+                glViewport(0, 0, W, H);
+
+                /* —— 合成：场景做黄/白色温，再叠回低分辨率光照图 —— */
+                glDisable(GL_BLEND);
+                bind_quad(g_prog_composite, a_composite, u_composite_center,
+                          u_composite_size, 1.f, 1.f);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+                glUniform1i(u_composite_scene, 0);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, g_light_tex);
+                glUniform1i(u_composite_light, 1);
+                glUniform3f(u_composite_grade, s->gradeR, s->gradeG, s->gradeB);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, 0);
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
     } else {
         /* —— 纯叠加：光晕加色 + 色罩乘法（不读帧缓冲） —— */
         glEnable(GL_BLEND);
@@ -1099,7 +1205,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 11,
+    .version_code = 15,
     .api_version = 1,
     .version = MOD_VERSION,
 };
@@ -1124,9 +1230,10 @@ static void init_mod(kernel_mod_handle_t *handle) {
 
     read_config_json();
     read_settings_txt();
-    LOG_INFO("配置：%s 档（采样=%d 阴影=1/%d 光晕=%.2f 光柱=%.2f）%s",
-             quality_name(g_quality), g_taps, g_shadow_div,
-             g_cfg_glow, g_cfg_rays, g_enabled ? "" : " — 已关闭，不绘制");
+    LOG_INFO("配置：%s 档（采样=%d 阴影=1/%d 强度=%.2fx 光色=%s 光晕=%.2f 光柱=%.2f）%s",
+             quality_name(g_quality), g_taps, g_shadow_div, g_cfg_shadow,
+             g_light_color ? "白光" : "黄光", g_cfg_glow, g_cfg_rays,
+             g_enabled ? "" : " — 已关闭，不绘制");
     LOG_INFO("初始化完成 v%s（快照 hook=%d swap=%d）", MOD_VERSION, (int)g_hook_draw,
              g_hook_installed ? 1 : 0);
 }

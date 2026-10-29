@@ -3,8 +3,8 @@
   "name": "光影 Lights And Shadows",
   "author": "lzup333/liuxin",
   "description": "感谢yiyang233大佬提供思路",
-  "version": "2.5.0-light",
-  "versionCode": 11,
+  "version": "2.6.3-light",
+  "versionCode": 15,
   "detailedInformationURL": "",
   "updateURL": "",
   "dependence": [],
@@ -38,21 +38,63 @@
     {
       "key": "quality",
       "title": "画质档位",
-      "description": "性能最省、视觉最细；选「自定义」时使用下面四项",
+      "description": "预设档位：性能档最省、视觉档最细；选「自定义」时下面四项才生效",
       "type": "CHOICE",
       "defaultValue": "balanced",
       "options": [
-        { "value": "perf", "label": "性能" },
-        { "value": "balanced", "label": "平衡" },
-        { "value": "visual", "label": "视觉" },
-        { "value": "custom", "label": "自定义" }
+        {
+          "value": "perf",
+          "label": "性能"
+        },
+        {
+          "value": "balanced",
+          "label": "平衡"
+        },
+        {
+          "value": "visual",
+          "label": "视觉"
+        },
+        {
+          "value": "custom",
+          "label": "自定义"
+        }
+      ],
+      "section": "常规"
+    },
+    {
+      "key": "shadow_strength",
+      "title": "阴影强度",
+      "description": "阴影浓度：100% 为基准，越高阴影越重；默认 135%",
+      "type": "INTEGER",
+      "defaultValue": 135,
+      "min": 50,
+      "max": 250,
+      "step": 5,
+      "unit": "%",
+      "section": "常规"
+    },
+    {
+      "key": "light_color",
+      "title": "光色",
+      "description": "画面日照色调：黄光偏暖，白光偏中性；会同时影响光柱和整体色温",
+      "type": "CHOICE",
+      "defaultValue": "warm",
+      "options": [
+        {
+          "value": "warm",
+          "label": "黄光"
+        },
+        {
+          "value": "white",
+          "label": "白光"
+        }
       ],
       "section": "常规"
     },
     {
       "key": "ray_samples",
       "title": "光柱采样",
-      "description": "仅自定义档生效；越大光柱越细腻、越吃性能",
+      "description": "仅自定义档生效；采样越多光柱越细腻，也越吃性能",
       "type": "INTEGER",
       "defaultValue": 16,
       "min": 4,
@@ -63,8 +105,8 @@
     },
     {
       "key": "shadow_div",
-      "title": "阴影分辨率",
-      "description": "仅自定义档生效；数值是画面缩小的倍数，2 最清晰、6 最省",
+      "title": "光照降采样",
+      "description": "仅自定义档生效；阴影和光柱缓冲按此倍数缩小，2 最清晰、6 最省",
       "type": "INTEGER",
       "defaultValue": 3,
       "min": 2,
@@ -76,7 +118,7 @@
     {
       "key": "glow",
       "title": "光晕强度",
-      "description": "仅自定义档生效；100 为默认亮度",
+      "description": "仅自定义档生效；100% 为基准亮度，默认 60%",
       "type": "INTEGER",
       "defaultValue": 60,
       "min": 1,
@@ -88,7 +130,7 @@
     {
       "key": "rays",
       "title": "光柱强度",
-      "description": "仅自定义档生效；100 为默认强度",
+      "description": "仅自定义档生效；100% 为基准强度，默认 55%",
       "type": "INTEGER",
       "defaultValue": 55,
       "min": 1,
