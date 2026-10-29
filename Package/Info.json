@@ -3,8 +3,8 @@
   "name": "光影 Lights And Shadows",
   "author": "lzup333/liuxin",
   "description": "感谢yiyang233大佬提供思路",
-  "version": "2.5.0-light",
-  "versionCode": 11,
+  "version": "2.6.0-light",
+  "versionCode": 12,
   "detailedInformationURL": "",
   "updateURL": "",
   "dependence": [],
@@ -42,10 +42,52 @@
       "type": "CHOICE",
       "defaultValue": "balanced",
       "options": [
-        { "value": "perf", "label": "性能" },
-        { "value": "balanced", "label": "平衡" },
-        { "value": "visual", "label": "视觉" },
-        { "value": "custom", "label": "自定义" }
+        {
+          "value": "perf",
+          "label": "性能"
+        },
+        {
+          "value": "balanced",
+          "label": "平衡"
+        },
+        {
+          "value": "visual",
+          "label": "视觉"
+        },
+        {
+          "value": "custom",
+          "label": "自定义"
+        }
+      ],
+      "section": "常规"
+    },
+    {
+      "key": "shadow_strength",
+      "title": "阴影强度",
+      "description": "越高阴影越重；100 为基准，默认 135",
+      "type": "INTEGER",
+      "defaultValue": 135,
+      "min": 50,
+      "max": 250,
+      "step": 5,
+      "unit": "%",
+      "section": "常规"
+    },
+    {
+      "key": "light_color",
+      "title": "光色",
+      "description": "太阳/月亮主光的颜色：黄光更暖，白光更中性",
+      "type": "CHOICE",
+      "defaultValue": "warm",
+      "options": [
+        {
+          "value": "warm",
+          "label": "黄光"
+        },
+        {
+          "value": "white",
+          "label": "白光"
+        }
       ],
       "section": "常规"
     },
