@@ -48,7 +48,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.6.3-light"
+#define MOD_VERSION "2.6.4-light"
 
 /* ============================================================================
  * 配置
@@ -630,8 +630,12 @@ static const char *FS_LIGHT =
     "  float shade = 0.0;\n"
     "  for (int i = 0; i < RAY_TAPS; ++i) {\n"
     "    float k = 1.0 + float(i) * uZoom;\n"
-    "    vec2 p = uSun + (uv - uSun) / k;\n"
-    "    shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * (1.0 - float(i) / 30.0);\n"
+    "    float w = 1.0 - float(i) / 30.0;\n"
+    "    for (int j = 0; j < 3; ++j) {\n"
+    "      float kj = k + (float(j) - 1.0) * uZoom / 3.0;\n"
+    "      vec2 p = uSun + (uv - uSun) / max(kj, 1.0);\n"
+    "      shade += texture2D(uShadow, clamp(p, 0.0, 1.0)).r * w / 3.0;\n"
+    "    }\n"
     "  }\n"
     "  shade = clamp(shade * 0.09 * uShadowK * uRays * uShadowStrength, 0.0, 1.0);\n"
     "  float lit = max(0.0, 1.0 - 0.96 * shade);\n"
@@ -1205,7 +1209,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 15,
+    .version_code = 19,
     .api_version = 1,
     .version = MOD_VERSION,
 };
