@@ -2,7 +2,7 @@
 // 光影 Lights And Shadows —— KernelLoader (tefkernel) 模组，手机端 / PE
 //
 // 灵感来源：tModLoader 的「Lights And Shadows」(作者 yiyang233)。实现与参数自研。
-// 感谢 yiyang233 大佬提供思路：先画光（中心取太阳位置）→ 蓝通道提阴影 → 沿太阳方向
+// 感谢 yiyang233 大佬提供思路：先画光（中心取太阳位置）→ 提阴影 → 沿太阳方向
 // 缩放叠加 → 光减阴影 → additive 叠回。
 //
 // ---------------------------------------------------------------------------
@@ -10,7 +10,7 @@
 // ---------------------------------------------------------------------------
 //   绘制走原生 GL 屏幕后处理（eglSwapBuffers 钩子，在交换之前画）：
 //     · 光：以太阳位置为中心的宽光晕（加色），颜色随一天时刻变化
-//     · 阴影：本帧缩到 1/3，按蓝色通道提取遮挡（树/地面蓝少 → 阴影强）
+//     · 阴影：本帧缩到 1/3，按蓝通道 + 亮度提取遮挡（树/图格/建筑都会进阴影图）
 //     · 光柱：阴影沿太阳方向逐层放大叠加成条纹，「光 − 阴影」漏出丁达尔光柱
 //   光按 additive 叠回场景，不破坏 alpha。
 //
@@ -20,8 +20,10 @@
 //   状态由 Main.DrawInterface_36_Cursor 的 postfix 读出来写进快照（游戏线程），
 //   渲染线程只读快照 —— 避免跨线程读游戏数据。
 //
-// 读属性的坑：稳定内核的 FFI 对**结构体返回**(Vector2) 有 bug（invoke 返回成功但不写缓冲）。
-// 这里所有 0 参 getter 一律走 patchlib_method_get_pointer **原生直调**，绕开内核 FFI。
+// 读属性：0 参 getter 一律走 patchlib_method_get_pointer **原生直调**。
+// （历史原因：旧内核在 c7827b8 之前，FFI 的结构体返回编组有 bug，Vector2 恒为 (0,0)；
+//   该问题已在内核 1.2.0 起修复。这里保留原生直调是因为没有 FFI 开销、
+//   也不依赖运行时签名解析，不是绕 bug。）
 //
 
 #include "mod-api/mod_core.h"
@@ -48,7 +50,7 @@ void (*mod_logger_write)(mod_log_level_t level, const char* tag, const char* fmt
 #define LOG_INFO(...)  do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_INFO,  "LightsAndShadows", __VA_ARGS__); } while (0)
 #define LOG_ERROR(...) do { if (mod_logger_write) mod_logger_write(MOD_LOG_LEVEL_ERROR, "LightsAndShadows", __VA_ARGS__); } while (0)
 
-#define MOD_VERSION "2.6.4-light"
+#define MOD_VERSION "2.6.5-light"
 
 /* ============================================================================
  * 配置
@@ -291,7 +293,9 @@ static double main_double(const char *name, double fallback) {
 }
 
 /* Vector2：优先读静态字段，否则原生直调 0 参 getter
- * （两个 float 的 HFA 结构体走 s0/s1 返回，和原生调用约定一致） */
+ * （两个 float 的 HFA 结构体走 s0/s1 返回，和原生调用约定一致。
+ *  内核 ≥1.2.0 的 patchlib_method_invoke_args 也能正确编组结构体返回，
+ *  这里只是为了零 FFI 开销保留直调。） */
 static bool main_vec2(const char *name, float *x, float *y) {
     void *slot = NULL;
     if (main_static_slot(name, &slot)) {
@@ -345,7 +349,7 @@ typedef struct {
     int   virtW, virtH;
     float sunU, sunV;            /* 太阳在 GL UV 里的位置（y 向上） */
     int   sunExact;              /* 1 = 取自游戏真实位置 */
-    float shadowM;               /* 阴影提取阈值：蓝通道低于它算阴影 */
+    float shadowM;               /* 阴影提取阈值：蓝通道低于它算天空（越大越容易保留阴影） */
     float shadowK;               /* 阴影强度（夜里关掉，0 = 不画条纹） */
     float warmR, warmG, warmB;   /* 光晕颜色 */
     float gradeR, gradeG, gradeB;/* 黄光/白光的整屏色温 */
@@ -399,8 +403,8 @@ static void compute_light(light_snap_t *s) {
         LOG_INFO("太阳诊断：k=%.2f 时间=%.0f 白天=%d 相机y=%.0f 世界表面=%.1f 屏幕=%dx%d",
                  k, time, day ? 1 : 0, camY, ws, sw, sh);
     }
-    /* 阴影：白天按蓝色通道（天空很蓝，b≈0.75；树/地面 b≈0.2）取阈值；
-     * 夜里整屏都暗，蓝通道区分不出天空，直接把条纹关掉 */
+    /* 阴影：白天按「蓝通道 + 亮度 + 偏蓝程度」区分天空/物体；
+     * 夜里整屏都暗，区分不出天空，直接把条纹关掉 */
     s->shadowM = day ? 0.50f : 0.02f;
     s->shadowK = day ? 1.0f : 0.0f;
 
@@ -479,7 +483,7 @@ static void compute_light(light_snap_t *s) {
  * 四、GL 层：仿原版「光 − 阴影」的屏幕后处理
  *
  *   1) 把本帧读成场景纹理（MSAA 用 glBlitFramebuffer 解析；不行再 glCopyTexSubImage2D）
- *   2) 场景缩到 1/3 分辨率，按蓝色通道取阴影：蓝越小阴影越强（天空是蓝的 → 不算阴影）
+ *   2) 场景缩到 1/3 分辨率，按蓝通道 + 亮度取阴影（天空偏蓝/偏亮 → 不算阴影）
  *   3) 阴影沿太阳方向逐层放大叠加成条纹；以太阳为中心的宽光晕减掉条纹，
  *      再 additive 叠回场景 —— 树缝里就漏出光柱
  *
@@ -584,7 +588,15 @@ static const char *FS_GLOW =
     "  gl_FragColor = vec4(uColor * fall * fall * uStrength, 1.0);\n"
     "}\n";
 
-/* —— 阴影提取（降采样）：先做 3x3 模糊软化图格边缘，再按蓝通道取阴影 —— */
+/* —— 阴影提取（降采样）：先做 3x3 模糊软化图格边缘，再取遮挡 ——
+ *
+ * 旧版只看蓝通道（树/土地蓝少 → 有阴影），但石头/砖块/木材这类灰色或暖色
+ * 图格的蓝通道接近天空，会被当成天空直接剔除，所以以前只有树有影子。
+ * 现在改成：
+ *   1) 基础遮挡 = 1 - 蓝通道（暗色物体，树/植被）
+ *   2) 再补一层 1 - 亮度（灰色/中性色图格，石头、砖、木头）
+ *   3) 只有「又亮、又明显偏蓝」的像素才判成天空（云是白的，不算天空）
+ * 这样图格、房子、地形都会进阴影图，夜里 shadowK=0 时仍然整体关闭。 */
 static const char *FS_SHADOW =
     "precision mediump float;\n"
     "uniform sampler2D uScene;\n"
@@ -593,19 +605,24 @@ static const char *FS_SHADOW =
     "void main(){\n"
     "  vec2 uv = gl_FragCoord.xy / uRes;\n"
     "  vec2 t = 1.5 / uRes;\n"
-    "  float b = 0.0;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( 0.0, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x, -t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x,  0.0)).b;\n"
-    "  b += texture2D(uScene, uv).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x,  0.0)).b;\n"
-    "  b += texture2D(uScene, uv + vec2(-t.x,  t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( 0.0,  t.y)).b;\n"
-    "  b += texture2D(uScene, uv + vec2( t.x,  t.y)).b;\n"
-    "  b /= 9.0;\n"
-    "  float s = pow(max(1.0 - b, 0.0), 0.75);\n"
-    "  s *= 1.0 - smoothstep(uM * 0.72, uM, b);\n"
+    "  vec3 c = vec3(0.0);\n"
+    "  c += texture2D(uScene, uv + vec2(-t.x, -t.y)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2( 0.0, -t.y)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2( t.x, -t.y)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2(-t.x,  0.0)).rgb;\n"
+    "  c += texture2D(uScene, uv).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2( t.x,  0.0)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2(-t.x,  t.y)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2( 0.0,  t.y)).rgb;\n"
+    "  c += texture2D(uScene, uv + vec2( t.x,  t.y)).rgb;\n"
+    "  c /= 9.0;\n"
+    "  float lum = dot(c, vec3(0.299, 0.587, 0.114));\n"
+    "  float blueDom = c.b - max(c.r, c.g);\n"
+    "  float sky = smoothstep(uM * 0.90, uM * 1.30, c.b)\n"
+    "            * smoothstep(0.02, 0.10, blueDom);\n"
+    "  float s = pow(max(1.0 - c.b, 0.0), 0.75);\n"
+    "  s = max(s, (1.0 - lum) * 0.85);\n"
+    "  s *= 1.0 - sky;\n"
     "  gl_FragColor = vec4(s, s, s, 1.0);\n"
     "}\n";
 
@@ -967,7 +984,7 @@ static void gl_render(const light_snap_t *s) {
     const int shadow_on = s->shadowK > 0.001f;
 
     if (g_mode == 1 && g_fbo_light && fill_scene(W, H)) {
-        /* —— 阴影：场景按档位降采样，模糊后按蓝色通道取阴影 —— */
+        /* —— 阴影：场景按档位降采样，模糊后按蓝通道 + 亮度取遮挡 —— */
         if (g_fbo_shadow && p_bind_fb) {
             glBindTexture(GL_TEXTURE_2D, g_shadow_tex);
             if (g_shadow_w != sw || g_shadow_h != sh) {
@@ -1209,7 +1226,7 @@ static void on_draw(patch_handle_t instance, void **args, void *result,
 
 static const kernel_mod_info_t g_info = {
     .pkg_id = "lzup.lightsandshadows",
-    .version_code = 19,
+    .version_code = 20,
     .api_version = 1,
     .version = MOD_VERSION,
 };
